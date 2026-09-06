@@ -223,7 +223,31 @@ class HuYaAuto:
         return False
 
     def login(self):
-        print('[LOGIN] checking login')
+        print('[LOGIN] checking authenticated read-only inventory first')
+        for attempt in range(1, 3):
+            try:
+                self._get_hl_count_api()  # Rejects unauthenticated/malformed responses.
+                if self.mode == 'send':
+                    injected = 0
+                    for part in self.cookie.split(';'):
+                        if '=' not in part:
+                            continue
+                        name, value = part.strip().split('=', 1)
+                        result = self.driver.execute_cdp_cmd('Network.setCookie', {
+                            'name': name.strip(), 'value': value.strip(),
+                            'domain': '.huya.com', 'path': '/', 'secure': True,
+                        })
+                        injected += bool(result.get('success'))
+                    if not injected:
+                        raise HuyaError('LOGIN_UNCONFIRMED', 'browser cookie injection failed')
+                    print(f'[COOKIE] browser injected_count={injected}')
+                print('[LOGIN] authenticated inventory API confirmed')
+                return True
+            except (requests.RequestException, ValueError, HuyaError, *DRIVER_ERRORS) as exc:
+                print(f'[LOGIN] API check attempt={attempt} error={type(exc).__name__}')
+                if attempt < 2:
+                    time.sleep(2)
+        print('[LOGIN] API unverified; checking browser login')
         if not self._safe_get(cfg.URLS['user_index'], 'login_bootstrap'):
             raise HuyaError('LOGIN_PAGE_UNAVAILABLE', 'user page did not become ready')
         count = 0

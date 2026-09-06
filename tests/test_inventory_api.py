@@ -4,6 +4,25 @@ import main
 
 
 class InventoryApiTests(unittest.TestCase):
+    def test_authenticated_api_login_does_not_open_user_page(self):
+        app = main.HuYaAuto.__new__(main.HuYaAuto)
+        app.mode = 'diagnose'
+        app._get_hl_count_api = MagicMock(return_value=25)
+        app._safe_get = MagicMock()
+        app.driver = MagicMock()
+        self.assertTrue(app.login())
+        app._safe_get.assert_not_called()
+        app.driver.execute_cdp_cmd.assert_not_called()
+
+    def test_send_mode_injects_cookie_after_authentication(self):
+        app = main.HuYaAuto.__new__(main.HuYaAuto)
+        app.mode, app.cookie = 'send', 'test=fixture'
+        app._get_hl_count_api = MagicMock(return_value=25)
+        app.driver = MagicMock()
+        app.driver.execute_cdp_cmd.return_value = {'success': True}
+        self.assertTrue(app.login())
+        self.assertEqual(app.driver.execute_cdp_cmd.call_args.args[0], 'Network.setCookie')
+
     def test_exact_count_and_empty(self):
         parse = main.HuYaAuto._parse_inventory_response
         def response(items): return {'status': 200, 'data': {'package': items}}
