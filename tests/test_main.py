@@ -1,0 +1,197 @@
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from selenium.common.exceptions import TimeoutException
+import main
+
+
+class CoreTests(unittest.TestCase):
+    def make_app(self, mode='diagnose', count=25):
+        app = main.HuYaAuto.__new__(main.HuYaAuto)
+        app.mode, app.rooms = mode, [123, 456]
+        app.inventory, app.submitted, app.outcome = None, 0, 'NOT_STARTED'
+        app.driver = MagicMock()
+        app.login = MagicMock(return_value=True)
+        app.get_hl_count = MagicMock(return_value=count)
+        app.send_to_room = MagicMock(return_value=0)
+        app._record_result = MagicMock()
+        return app
+
+    def test_diagnosis_never_sends(self):
+        app = self.make_app()
+        self.assertTrue(app.run())
+        app.send_to_room.assert_not_called()
+        self.assertEqual(app.outcome, 'DIAGNOSE_OK')
+        app.driver.quit.assert_called_once()
+
+    def test_zero_is_verified_success(self):
+        app = self.make_app(mode='send', count=0)
+        self.assertTrue(app.run())
+        self.assertEqual(app.outcome, 'EMPTY_STOCK')
+        app.send_to_room.assert_not_called()
+
+    def test_query_error_is_not_zero(self):
+        app = self.make_app()
+        app.get_hl_count.side_effect = main.HuyaError('INVENTORY_QUERY_FAILED', 'NOT zero stock')
+        self.assertFalse(app.run())
+        self.assertIsNone(app.inventory)
+        self.assertEqual(app.outcome, 'INVENTORY_QUERY_FAILED')
+        app.send_to_room.assert_not_called()
+
+    def test_login_failure_stops_inventory(self):
+        app = self.make_app()
+        app.login.side_effect = main.HuyaError('LOGIN_UNCONFIRMED', 'missing')
+        self.assertFalse(app.run())
+        app.get_hl_count.assert_not_called()
+
+    def test_direct_send_guard_before_navigation(self):
+        app = self.make_app()
+        with self.assertRaises(main.HuyaError):
+            main.HuYaAuto.send_to_room(app, 123, 1)
+        app.driver.get.assert_not_called()
+
+    def test_send_error_not_retried(self):
+        app = self.make_app(mode='send')
+        app.send_to_room.side_effect = main.HuyaError('SEND_FAILED_OR_UNKNOWN', 'timeout')
+        self.assertFalse(app.run())
+        app.send_to_room.assert_called_once()
+        self.assertEqual(app.outcome, 'SEND_FAILED_OR_UNKNOWN')
+
+    def test_send_requires_inventory_postcondition(self):
+        app = self.make_app(mode='send')
+        app.send_to_room.side_effect = [13, 12]
+        app.get_hl_count.side_effect = [25, 25]
+        self.assertFalse(app.run())
+        self.assertEqual(app.outcome, 'SEND_FAILED_OR_UNKNOWN')
+
+    def test_parse_rooms_no_fallback_or_duplicates(self):
+        self.assertEqual(main.HuYaAuto._parse_rooms(''), [])
+        self.assertEqual(main.HuYaAuto._parse_rooms('123, 123,456'), [123, 456])
+        for invalid in ('abc', '-1', '0', '123; echo bad'):
+            with self.subTest(invalid=invalid), self.assertRaises(main.HuyaError):
+                main.HuYaAuto._parse_rooms(invalid)
+
+    def test_cli_defaults_to_diagnosis(self):
+        with patch('sys.argv', ['main.py']), patch.object(main, 'HuYaAuto') as cls:
+            cls.return_value.run.return_value = True
+            self.assertEqual(main.main(), 0)
+            cls.assert_called_once_with(mode='diagnose')
+
+    def test_navigation_timeout_requires_readiness(self):
+        app = self.make_app()
+        app._debug_capture = MagicMock()
+        app.driver.current_url = 'https://hd.huya.com/pay/index.html?private=DO_NOT_LOG'
+        app.driver.get.side_effect = TimeoutException('DO_NOT_LOG')
+        with patch.object(main, 'WebDriverWait') as wait:
+            wait.return_value.until.return_value = True
+            self.assertTrue(app._safe_get('https://hd.huya.com/pay/index.html', 'inventory'))
+        with patch.object(main, 'WebDriverWait') as wait, patch.object(main.time, 'sleep'):
+            wait.return_value.until.side_effect = TimeoutException('DO_NOT_LOG')
+            self.assertFalse(app._safe_get('https://hd.huya.com/pay/index.html', 'inventory'))
+            self.assertEqual(wait.return_value.until.call_count, 2)
+
+    def test_inventory_response_errors_never_default_to_zero(self):
+        app = self.make_app()
+        app._safe_get = MagicMock(return_value=False)
+        app._debug_capture = MagicMock()
+        with patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError) as exc:
+            main.HuYaAuto.get_hl_count(app)
+        self.assertEqual(exc.exception.code, 'INVENTORY_QUERY_FAILED')
+        self.assertEqual(app._safe_get.call_count, 2)
+
+    def test_artifact_no_private_html_screenshot_or_url(self):
+        app = self.make_app()
+        app.driver.current_url = 'https://i.huya.com/?secret=NEVER_EXPORT'
+        app.driver.execute_script.return_value = {'ready_state': 'complete', 'body_present': True}
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out:
+            app.debug_dir = Path(tmp)
+            app._debug_capture('login_check')
+            files = list(Path(tmp).iterdir())
+            self.assertEqual(len(files), 1)
+            self.assertNotIn('NEVER_EXPORT', files[0].read_text() + out.getvalue())
+            self.assertEqual(files[0].suffix, '.json')
+        app.driver.save_screenshot.assert_not_called()
+
+
+@unittest.skipUnless(os.getenv('RUN_BROWSER_TESTS') == '1', 'opt-in local browser fixtures')
+class BrowserFixtureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        cls.response = {'status': 200, 'data': {'package': [{'cName': '虎粮', 'num': 25}]}}
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                html = '''<!doctype html><body><button id="packTab">包裹</button><div id="myWrap"></div>
+                <script>
+                const hooks = [];
+                window.jQuery = {ajaxPrefilter: f => hooks.push(f), _data: () => ({click: [1]})};
+                document.getElementById('packTab').onclick = () => {
+                    hooks.forEach(f => f({url:'https://q.huya.com/index.php?m=PackageApi&do=listTotal'}, {}, {
+                        done: cb => setTimeout(() => cb(RESPONSE), 200), fail: () => {}
+                    }));
+                };
+                </script>'''.replace('RESPONSE', json.dumps(cls.response))
+                data = html.encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def log_message(self, *args):
+                pass
+        cls.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        cls.thread = Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.url = f'http://127.0.0.1:{cls.server.server_port}/inventory'
+        cls.app = main.HuYaAuto.__new__(main.HuYaAuto)
+        cls.app.mode = 'diagnose'
+        cls.app.driver = cls.app._init_browser()
+        cls.app._debug_capture = MagicMock()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.app.driver.quit()
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_real_browser_inventory_observer_and_exact_gift(self):
+        cases = [
+            ([{'cName': '虎粮', 'num': 25}], 25),
+            ([{'cName': '超粉虎粮', 'num': 99}, {'cName': '虎粮', 'num': 5}], 5),
+            ([{'cName': '虎粮', 'num': 0}], 0),
+            ([], 0),
+        ]
+        for package, expected in cases:
+            with self.subTest(package=package), patch.dict(main.cfg.URLS, pay_index=self.url):
+                type(self).response = {'status': 200, 'data': {'package': package}}
+                self.assertEqual(self.app.get_hl_count(), expected)
+
+    def test_real_browser_invalid_response_is_error(self):
+        type(self).response = {'status': 401, 'data': {}}
+        with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
+            with self.assertRaises(main.HuyaError):
+                self.app.get_hl_count()
+
+    def test_real_browser_bad_numeric_stock_is_error(self):
+        for value in (-1, None, '', True, 'not-a-count'):
+            type(self).response = {'status': 200, 'data': {'package': [{'cName': '虎粮', 'num': value}]}}
+            with self.subTest(value=value), patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
+                with self.assertRaises(main.HuyaError):
+                    self.app.get_hl_count()
+
+    def test_real_browser_malformed_package_is_not_empty(self):
+        type(self).response = {'status': 200, 'data': {'package': [{'unexpected': 25}]}}
+        with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
+            with self.assertRaises(main.HuyaError):
+                self.app.get_hl_count()
+
+
+if __name__ == '__main__':
+    unittest.main()

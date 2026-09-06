@@ -3,3 +3,6 @@ chromeData
 venv
 __pycache__
 cookie
+.venv/
+debug_artifacts/
+*.pyc
