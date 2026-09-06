@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from selenium.common.exceptions import TimeoutException
+from urllib3.exceptions import ReadTimeoutError
 import main
 
 
@@ -55,6 +56,10 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(main.HuyaError):
             main.HuYaAuto.send_to_room(app, 123, 1)
         app.driver.get.assert_not_called()
+
+    def test_direct_submit_guard(self):
+        with self.assertRaises(main.HuyaError):
+            self.make_app()._submit_gift()
 
     def test_send_error_not_retried(self):
         app = self.make_app(mode='send')
@@ -105,6 +110,52 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(exc.exception.code, 'INVENTORY_QUERY_FAILED')
         self.assertEqual(app._safe_get.call_count, 2)
 
+    def test_transport_timeout_retries_readonly_navigation(self):
+        app = self.make_app()
+        app._debug_capture = MagicMock()
+        app.driver.get.side_effect = ReadTimeoutError(None, '', 'private detail')
+        with patch.object(main.time, 'sleep'):
+            self.assertFalse(app._safe_get('https://i.huya.com/', 'login'))
+        self.assertEqual(app.driver.get.call_count, 2)
+
+    def test_cleanup_error_does_not_override_result(self):
+        app = self.make_app()
+        app.driver.quit.side_effect = ReadTimeoutError(None, '', 'private detail')
+        self.assertTrue(app.run())
+        self.assertEqual(app.outcome, 'DIAGNOSE_OK')
+
+    def test_unknown_submission_stops_without_retry(self):
+        app = self.make_app(mode='send')
+        app.driver.execute_script.return_value = True
+        app.wait = MagicMock()
+        send_button = MagicMock()
+        app.wait.until.side_effect = [send_button, ReadTimeoutError(None, '', 'private detail')]
+        with self.assertRaises(ReadTimeoutError):
+            app._submit_gift()
+        send_button.click.assert_called_once()
+
+    def test_old_document_and_wrong_query_not_ready(self):
+        app = self.make_app()
+        app._debug_capture = MagicMock()
+        marker = {}
+        def execute(script, *args):
+            if script.startswith('window.__huyaNavigationMarker ='):
+                marker['value'] = args[0]
+            elif '__huyaNavigationMarker' in script:
+                return marker.get('value')
+            return True
+        app.driver.execute_script.side_effect = execute
+        class OnePoll:
+            def __init__(self, driver, *args, **kwargs): self.driver = driver
+            def until(self, predicate):
+                if not predicate(self.driver): raise TimeoutException()
+                return True
+        with patch.object(main, 'WebDriverWait', OnePoll):
+            app.driver.current_url = 'https://hd.huya.com/gift?lp=1&gid=2'
+            self.assertFalse(app._safe_get(app.driver.current_url, 'gift', attempts=1))
+            app.driver.get.side_effect = lambda _: marker.clear()
+            self.assertFalse(app._safe_get('https://hd.huya.com/gift?lp=3&gid=2', 'gift', attempts=1))
+
     def test_artifact_no_private_html_screenshot_or_url(self):
         app = self.make_app()
         app.driver.current_url = 'https://i.huya.com/?secret=NEVER_EXPORT'
@@ -131,7 +182,7 @@ class BrowserFixtureTests(unittest.TestCase):
                 html = '''<!doctype html><body><button id="packTab">包裹</button><div id="myWrap"></div>
                 <script>
                 const hooks = [];
-                window.jQuery = {ajaxPrefilter: f => hooks.push(f), _data: () => ({click: [1]})};
+                window.jQuery = {ajaxPrefilter: f => hooks.push(f), _data: () => ({click: [{selector:'#nav li'}]})};
                 document.getElementById('packTab').onclick = () => {
                     hooks.forEach(f => f({url:'https://q.huya.com/index.php?m=PackageApi&do=listTotal'}, {}, {
                         done: cb => setTimeout(() => cb(RESPONSE), 200), fail: () => {}
@@ -191,6 +242,39 @@ class BrowserFixtureTests(unittest.TestCase):
         with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
             with self.assertRaises(main.HuyaError):
                 self.app.get_hl_count()
+
+    def test_real_browser_unrelated_handler_not_ready(self):
+        self.app._safe_get(self.url, 'fixture', ready=lambda d: d.execute_script('return Boolean(window.jQuery)'))
+        self.app.driver.execute_script("window.jQuery._data = () => ({click:[{selector:'.unrelated'}]})")
+        self.assertFalse(self.app.driver.execute_script(main.PACK_READY))
+
+    def test_real_browser_toast_success_failure_and_stale(self):
+        self.app._safe_get(self.url, 'fixture')
+        for toast, expected in [('送礼成功', 'success'), ('礼物数量不足', 'rejected')]:
+            self.app.driver.execute_script("document.querySelectorAll('.g-tips').forEach(x=>x.remove())")
+            self.assertTrue(self.app.driver.execute_script(main.GIFT_RESULT_OBSERVER))
+            self.app.driver.execute_script("const div=document.createElement('div');div.className='g-tips';const p=document.createElement('p');p.textContent=arguments[0];div.appendChild(p);document.body.appendChild(div)", toast)
+            result = main.WebDriverWait(self.app.driver, 2).until(lambda d: d.execute_script("return window.__huyaGiftResult.status !== 'pending' && window.__huyaGiftResult.status"))
+            self.assertEqual(result, expected)
+            self.assertFalse(self.app.driver.execute_script(main.GIFT_RESULT_OBSERVER))
+
+    def test_real_browser_submit_waits_for_business_success(self):
+        self.app._safe_get(self.url, 'fixture')
+        self.app.driver.execute_script("""
+            document.body.innerHTML='<button class="c-send">赠送</button><button class="btn-success" style="display:none">立即送出</button>';
+            window.sentClicks=0;window.confirmClicks=0;
+            document.querySelector('.c-send').onclick=()=>{window.sentClicks++;document.querySelector('.btn-success').style.display='block'};
+            document.querySelector('.btn-success').onclick=()=>{window.confirmClicks++;setTimeout(()=>{
+                const div=document.createElement('div');div.className='g-tips';div.innerHTML='<p>送礼成功</p>';document.body.appendChild(div);
+            },350)};
+        """)
+        self.app.mode = 'send'
+        self.app.wait = main.WebDriverWait(self.app.driver, 2)
+        try:
+            self.app._submit_gift()
+            self.assertEqual(self.app.driver.execute_script('return [window.sentClicks, window.confirmClicks, window.__huyaGiftResult.status]'), [1, 1, 'success'])
+        finally:
+            self.app.mode = 'diagnose'
 
 
 if __name__ == '__main__':

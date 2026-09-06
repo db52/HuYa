@@ -7,8 +7,11 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from urllib3.exceptions import HTTPError as TransportError
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -21,6 +24,32 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 import config as cfg
+
+DRIVER_ERRORS = (WebDriverException, TransportError, TimeoutError, ConnectionError)
+
+PACK_READY = r"""
+const jq = window.jQuery;
+return Boolean(jq && jq._data && ((jq._data(document, 'events') || {}).click || [])
+    .some(handler => handler.selector === '#nav li'));
+"""
+
+# The public gift app shows this toast only after iPayRespCode === 0.
+# Observe a NEW toast in this document; never reuse a prior room's success.
+GIFT_RESULT_OBSERVER = r"""
+if (document.querySelector('.g-tips')) return false;
+if (window.__huyaGiftObserver) window.__huyaGiftObserver.disconnect();
+window.__huyaGiftResult = {status: 'pending'};
+window.__huyaGiftObserver = new MutationObserver(function() {
+    if (window.__huyaGiftResult.status !== 'pending') return;
+    const toast = document.querySelector('.g-tips p');
+    if (!toast || !toast.textContent.trim()) return;
+    window.__huyaGiftResult = {
+        status: toast.textContent.trim() === '送礼成功' ? 'success' : 'rejected'
+    };
+});
+window.__huyaGiftObserver.observe(document.body, {childList: true, subtree: true, characterData: true});
+return true;
+"""
 
 
 class HuyaError(RuntimeError):
@@ -152,9 +181,16 @@ class HuYaAuto:
         if expected.hostname == 'huya.com':
             hosts.add('www.huya.com')
 
+        marker = None
+
         def page_ready(driver):
             current = urlsplit(driver.current_url)
-            if current.hostname not in hosts or current.path != expected.path:
+            if current.hostname not in hosts or current.path != expected.path or current.scheme != expected.scheme:
+                return False
+            actual_query = parse_qs(current.query)
+            if any(actual_query.get(key) != value for key, value in parse_qs(expected.query).items()):
+                return False
+            if driver.execute_script('return window.__huyaNavigationMarker || null') == marker:
                 return False
             if not driver.execute_script('return Boolean(document.body)'):
                 return False
@@ -162,6 +198,10 @@ class HuYaAuto:
 
         for attempt in range(1, attempts + 1):
             try:
+                marker = uuid.uuid4().hex
+                # Fail this attempt if we cannot mark the old document: accepting
+                # its DOM after an asynchronous same-URL navigation is unsafe.
+                self.driver.execute_script('window.__huyaNavigationMarker = arguments[0]', marker)
                 try:
                     self.driver.get(url)
                 except TimeoutException:
@@ -170,13 +210,13 @@ class HuYaAuto:
                 WebDriverWait(self.driver, timeout, poll_frequency=0.5).until(page_ready)
                 print(f'[NAV] {label}: ready attempt={attempt}')
                 return True
-            except WebDriverException as exc:
+            except DRIVER_ERRORS as exc:
                 print(f'[NAV] {label}: not ready attempt={attempt} error={type(exc).__name__}')
                 self._debug_capture(label)
                 if attempt < attempts:
                     try:
                         self.driver.execute_script('window.stop()')
-                    except WebDriverException:
+                    except DRIVER_ERRORS:
                         pass
                     time.sleep(2)
         return False
@@ -211,12 +251,7 @@ class HuYaAuto:
                     tab = EC.element_to_be_clickable((By.ID, cfg.PAY_PAGE['pack_tab']))(driver)
                     # The page binds navigation handlers in mainv2.js. A static
                     # packTab existing in HTML alone does not prove JS is ready.
-                    handlers = driver.execute_script("""
-                        const jq = window.jQuery;
-                        if (!jq || !jq._data) return false;
-                        return [document, document.body, document.getElementById('nav')]
-                            .some(x => x && (jq._data(x, 'events') || {}).click);
-                    """)
+                    handlers = driver.execute_script(PACK_READY)
                     return tab if handlers else False
                 if not self._safe_get(cfg.URLS['pay_index'], 'inventory_page', ready=ready,
                                       timeout=45, attempts=1):
@@ -235,12 +270,38 @@ class HuYaAuto:
                     raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory response invalid')
                 print(f'[INVENTORY] query confirmed; ordinary_huliang={count}')
                 return count
-            except (WebDriverException, HuyaError) as exc:
+            except (*DRIVER_ERRORS, HuyaError) as exc:
                 print(f'[INVENTORY] failed attempt={attempt} error={type(exc).__name__}')
                 self._debug_capture('inventory_query')
                 if attempt < 2:
                     time.sleep(2)
         raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory could not be verified; NOT zero stock')
+
+    def _gift_result(self):
+        result = self.driver.execute_script('return window.__huyaGiftResult || {status:"pending"}')
+        status = result.get('status')
+        if status == 'rejected':
+            raise HuyaError('SEND_REJECTED', 'page reported a business failure; do not retry')
+        return status == 'success'
+
+    def _submit_gift(self):
+        if self.mode != 'send':
+            raise HuyaError('SEND_DISABLED', 'diagnose mode cannot submit a gift')
+        if not self.driver.execute_script(GIFT_RESULT_OBSERVER):
+            raise HuyaError('SEND_PREPARATION_FAILED', 'stale toast present')
+        self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, cfg.GIFT['send_class']))).click()
+
+        def confirmation_or_result(driver):
+            if self._gift_result():
+                return 'success'
+            button = EC.element_to_be_clickable((By.CLASS_NAME, cfg.GIFT['confirm_class']))(driver)
+            return button if button else False
+
+        action = self.wait.until(confirmation_or_result)
+        if action != 'success':
+            action.click()  # Exactly once. Never retry either submission click.
+            WebDriverWait(self.driver, 25, poll_frequency=0.2).until(lambda _: self._gift_result())
+        print('[SEND] fresh business success confirmed')
 
     def send_to_room(self, room_id, count):
         if self.mode != 'send':
@@ -265,12 +326,12 @@ class HuYaAuto:
             inp.click()
             inp.clear()
             inp.send_keys(str(count))
-            self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, cfg.GIFT['send_class']))).click()
-            # No send/confirmation click is retried, even if response is unknown.
-            self.wait.until(EC.element_to_be_clickable((By.CLASS_NAME, cfg.GIFT['confirm_class']))).click()
-            print(f'[SEND] confirmation submitted count={count}; verifying later')
+            if inp.get_attribute('value') != str(count):
+                raise HuyaError('SEND_PREPARATION_FAILED', 'gift count did not match requested value')
+            self._submit_gift()
+            print(f'[SEND] confirmed count={count}')
             return count
-        except (WebDriverException, HuyaError) as exc:
+        except Exception as exc:
             self._debug_capture('send_failed_or_unknown')
             raise HuyaError('SEND_FAILED_OR_UNKNOWN', type(exc).__name__) from None
 
@@ -307,10 +368,13 @@ class HuYaAuto:
             self.outcome = 'UNEXPECTED_ERROR'
             print('[ERROR] unexpected ' + type(exc).__name__)
         finally:
-            self._record_result()
+            try:
+                self._record_result()
+            except Exception as exc:
+                print('[RESULT] record failed: ' + type(exc).__name__)
             try:
                 self.driver.quit()
-            except WebDriverException:
+            except Exception:
                 print('[EXIT] browser cleanup failed')
         return ok
 
