@@ -8,6 +8,7 @@ import shutil
 import sys
 import time
 import uuid
+import requests
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -243,7 +244,69 @@ class HuYaAuto:
         print('[LOGIN] confirmed (username not logged)')
         return True
 
+    @staticmethod
+    def _parse_inventory_response(response):
+        if (not isinstance(response, dict) or response.get('status') != 200 or
+                not isinstance(response.get('data'), dict) or
+                not isinstance(response['data'].get('package'), list)):
+            raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory response invalid')
+        total = 0
+        for item in response['data']['package']:
+            if not isinstance(item, dict) or not isinstance(item.get('cName'), str) or not item['cName'].strip():
+                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory item malformed')
+            if item['cName'] != '虎粮':
+                continue
+            value = item.get('num')
+            if isinstance(value, str) and re.fullmatch(r'[0-9]+', value):
+                value = int(value)
+            if type(value) is not int or value < 0 or value > 2**53 - 1:
+                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory count malformed')
+            total += value
+        if total > 2**53 - 1:
+            raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory count out of range')
+        return total
+
+    def _get_hl_count_api(self):
+        # Same two GET endpoints used by pay/js/mainv2.js handlePackage().
+        # No payment/gift endpoint; redirects rejected; cookies scoped to Huya.
+        with requests.Session() as session:
+            for part in self.cookie.split(';'):
+                if '=' in part:
+                    name, value = part.strip().split('=', 1)
+                    session.cookies.set(name.strip(), value.strip(), domain='.huya.com', path='/')
+            session.headers.update({'Referer': cfg.URLS['pay_index'],
+                                    'User-Agent': 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36'})
+            url = 'https://q.huya.com/index.php'
+            signed = session.get(url, params={'m': 'PackageApi', 'do': 'getTimeSign'},
+                                 timeout=(8, 20), allow_redirects=False)
+            if signed.status_code != 200:
+                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory signing HTTP failure')
+            signed = signed.json()
+            if (not isinstance(signed, dict) or signed.get('status') != 200 or
+                    not isinstance(signed.get('data'), dict) or
+                    not signed['data'].get('time') or not signed['data'].get('sign')):
+                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory signing rejected')
+            response = session.get(url, params={'m': 'PackageApi', 'do': 'listTotal',
+                'time': signed['data']['time'], 'sign': signed['data']['sign']},
+                timeout=(8, 20), allow_redirects=False)
+            if response.status_code != 200:
+                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory HTTP failure')
+            return self._parse_inventory_response(response.json())
+
     def get_hl_count(self):
+        for attempt in range(1, 3):
+            try:
+                count = self._get_hl_count_api()
+                print(f'[INVENTORY] read-only API confirmed; ordinary_huliang={count}')
+                return count
+            except (requests.RequestException, ValueError, HuyaError) as exc:
+                print(f'[INVENTORY] read-only API attempt={attempt} error={type(exc).__name__}')
+                if attempt < 2:
+                    time.sleep(2)
+        print('[INVENTORY] API unverified; trying browser inventory as fallback')
+        return self._get_hl_count_page()
+
+    def _get_hl_count_page(self):
         print('[INVENTORY] querying ordinary 虎粮')
         for attempt in range(1, 3):
             try:

@@ -106,7 +106,7 @@ class CoreTests(unittest.TestCase):
         app._safe_get = MagicMock(return_value=False)
         app._debug_capture = MagicMock()
         with patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError) as exc:
-            main.HuYaAuto.get_hl_count(app)
+            main.HuYaAuto._get_hl_count_page(app)
         self.assertEqual(exc.exception.code, 'INVENTORY_QUERY_FAILED')
         self.assertEqual(app._safe_get.call_count, 2)
 
@@ -222,26 +222,26 @@ class BrowserFixtureTests(unittest.TestCase):
         for package, expected in cases:
             with self.subTest(package=package), patch.dict(main.cfg.URLS, pay_index=self.url):
                 type(self).response = {'status': 200, 'data': {'package': package}}
-                self.assertEqual(self.app.get_hl_count(), expected)
+                self.assertEqual(self.app._get_hl_count_page(), expected)
 
     def test_real_browser_invalid_response_is_error(self):
         type(self).response = {'status': 401, 'data': {}}
         with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
             with self.assertRaises(main.HuyaError):
-                self.app.get_hl_count()
+                self.app._get_hl_count_page()
 
     def test_real_browser_bad_numeric_stock_is_error(self):
         for value in (-1, None, '', True, 'not-a-count'):
             type(self).response = {'status': 200, 'data': {'package': [{'cName': '虎粮', 'num': value}]}}
             with self.subTest(value=value), patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
                 with self.assertRaises(main.HuyaError):
-                    self.app.get_hl_count()
+                    self.app._get_hl_count_page()
 
     def test_real_browser_malformed_package_is_not_empty(self):
         type(self).response = {'status': 200, 'data': {'package': [{'unexpected': 25}]}}
         with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
             with self.assertRaises(main.HuyaError):
-                self.app.get_hl_count()
+                self.app._get_hl_count_page()
 
     def test_real_browser_unrelated_handler_not_ready(self):
         self.app._safe_get(self.url, 'fixture', ready=lambda d: d.execute_script('return Boolean(window.jQuery)'))
