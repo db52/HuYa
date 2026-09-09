@@ -244,7 +244,10 @@ class HuYaAuto:
                 print('[LOGIN] authenticated inventory API confirmed')
                 return True
             except (requests.RequestException, ValueError, HuyaError, *DRIVER_ERRORS) as exc:
-                print(f'[LOGIN] API check attempt={attempt} error={type(exc).__name__}')
+                detail = f'{exc.code}: {exc}' if isinstance(exc, HuyaError) else type(exc).__name__
+                print(f'[LOGIN] API check attempt={attempt} error={detail}')
+                if isinstance(exc, HuyaError) and exc.code == 'LOGIN_REQUIRED':
+                    raise  # Explicit authentication rejection cannot be fixed by retries.
                 if attempt < 2:
                     time.sleep(2)
         print('[LOGIN] API unverified; checking browser login')
@@ -300,22 +303,52 @@ class HuYaAuto:
                     session.cookies.set(name.strip(), value.strip(), domain='.huya.com', path='/')
             session.headers.update({'Referer': cfg.URLS['pay_index'],
                                     'User-Agent': 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36'})
-            url = 'https://q.huya.com/index.php'
-            signed = session.get(url, params={'m': 'PackageApi', 'do': 'getTimeSign'},
-                                 timeout=(8, 20), allow_redirects=False)
-            if signed.status_code != 200:
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory signing HTTP failure')
-            signed = signed.json()
-            if (not isinstance(signed, dict) or signed.get('status') != 200 or
-                    not isinstance(signed.get('data'), dict) or
+            signed = self._package_api_get(session, 'getTimeSign')
+            if (not isinstance(signed.get('data'), dict) or
                     not signed['data'].get('time') or not signed['data'].get('sign')):
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory signing rejected')
-            response = session.get(url, params={'m': 'PackageApi', 'do': 'listTotal',
-                'time': signed['data']['time'], 'sign': signed['data']['sign']},
-                timeout=(8, 20), allow_redirects=False)
-            if response.status_code != 200:
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory HTTP failure')
-            return self._parse_inventory_response(response.json())
+                raise HuyaError('INVENTORY_RESPONSE_INVALID',
+                                'getTimeSign: HTTP 200; signing fields invalid')
+            response = self._package_api_get(session, 'listTotal', {
+                'time': signed['data']['time'], 'sign': signed['data']['sign']})
+            return self._parse_inventory_response(response)
+
+    @staticmethod
+    def _package_api_get(session, action, extra=None):
+        # Action names and error details below are local constants. Never log
+        # response messages, bodies, signed request URLs or transport exceptions.
+        if action not in ('getTimeSign', 'listTotal'):
+            raise HuyaError('CONFIG_ERROR', 'read-only package action required')
+        params = dict(extra or {})
+        params.update({'m': 'PackageApi', 'do': action})
+        try:
+            response = session.get('https://q.huya.com/index.php', params=params,
+                                   timeout=(8, 20), allow_redirects=False)
+        except requests.Timeout:
+            raise HuyaError('INVENTORY_NETWORK_TIMEOUT', f'{action}: request failed') from None
+        except requests.exceptions.SSLError:
+            raise HuyaError('INVENTORY_TLS_FAILED', f'{action}: request failed') from None
+        except requests.RequestException:
+            raise HuyaError('INVENTORY_NETWORK_FAILED', f'{action}: request failed') from None
+        if response.status_code != 200:
+            raise HuyaError('INVENTORY_HTTP_FAILED', f'{action}: HTTP {response.status_code}')
+        try:
+            payload = response.json()
+        except ValueError:
+            raise HuyaError('INVENTORY_RESPONSE_INVALID',
+                            f'{action}: HTTP 200; non-JSON response') from None
+        status = payload.get('status') if isinstance(payload, dict) else None
+        if type(status) is not int or not 0 <= status <= 9999:
+            raise HuyaError('INVENTORY_RESPONSE_INVALID',
+                            f'{action}: HTTP 200; invalid business status')
+        if status == 501:
+            # Verified against these public read-only endpoints without cookies:
+            # HTTP 200 + JSON status=501 is "not logged in", not HTTP 501.
+            raise HuyaError('LOGIN_REQUIRED',
+                            f'{action}: HTTP 200; business_status=501; login required')
+        if status != 200:
+            raise HuyaError('INVENTORY_API_REJECTED',
+                            f'{action}: HTTP 200; business_status={status}')
+        return payload
 
     def get_hl_count(self):
         for attempt in range(1, 3):
@@ -324,7 +357,10 @@ class HuYaAuto:
                 print(f'[INVENTORY] read-only API confirmed; ordinary_huliang={count}')
                 return count
             except (requests.RequestException, ValueError, HuyaError) as exc:
-                print(f'[INVENTORY] read-only API attempt={attempt} error={type(exc).__name__}')
+                detail = f'{exc.code}: {exc}' if isinstance(exc, HuyaError) else type(exc).__name__
+                print(f'[INVENTORY] read-only API attempt={attempt} error={detail}')
+                if isinstance(exc, HuyaError) and exc.code == 'LOGIN_REQUIRED':
+                    raise
                 if attempt < 2:
                     time.sleep(2)
         print('[INVENTORY] API unverified; trying browser inventory as fallback')
