@@ -6,7 +6,11 @@
 - 显式 `python main.py --mode send` / Action `mode=send` 才赠送；定时任务仍使用 send，仅在默认分支运行。
 - 已在 GitHub Actions 验证诊断及真实赠送：登录有效、普通虎粮 25 个送出、业务成功提示及库存归零均确认。定时执行仍可能受网络、页面变化和 Cookie 有效期影响；发生结果未知时请人工核对，不要盲目重跑。
 - 页面使用 `page_load_strategy=none` + 关键元素就绪检查。登录/库存最多重试两次，发送和确认按钮不自动重试。
-- 优先直接调用网页同款只读 `getTimeSign` → `listTotal` GET 接口，避免充值页无关资源阻塞；失败才回退到网页观察库存响应。只精确匹配普通“虎粮”，不包含超粉虎粮。查询失败不当作零库存。
+- 优先直接调用网页同款只读 `getTimeSign` → `listTotal` GET 接口，避免充值页无关资源阻塞；明确业务状态 501（未登录）立即停止，网络或结构失败才尝试网页。只精确匹配普通“虎粮”，不包含超粉虎粮。查询失败不当作零库存。
+- 浏览器延迟启动：诊断或 API 确认零库存无需 Chrome，实际送礼或必要网页回退才启动。
+- Actions 结果摘要直接显示模式、结果、库存和已确认数量。Telegram 仅首次失败、原因变化及恢复提醒，正常运行静默。去重状态来自同分支的历史 artifact（保留90天）；读取失败不会盲目群发，通知结果未知不自动重发。
+- 通知需 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`TELEGRAM_THREAD_ID` 三个 Secret。手动 diagnose 可用 `test_notice=true` 发送接入测试；不进行送礼。
+- GitHub 定时调度可能延迟，00:01 是期望触发时间，不保证准点。
 - 公共 artifact 仅包含白名单 JSON（阶段、就绪状态、结果），不保存/上传 Cookie、原始 HTML、截图、完整 URL 或用户名。
 - `DIAGNOSE_OK`：登录和库存查询通过；`EMPTY_STOCK`：确认库存为零；`INVENTORY_QUERY_FAILED`：查询失败；`SEND_FAILED_OR_UNKNOWN`：停止并人工核对，勿盲目 rerun。
 - 每个房间送礼后必须出现本次页面新产生的“送礼成功”业务提示，才会计数并继续；拒绝/超时/结果未知立即停止，不补点。全部完成后重新查库存，库存核对不能取代平台赠送账单。

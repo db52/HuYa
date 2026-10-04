@@ -14,14 +14,18 @@ class InventoryApiTests(unittest.TestCase):
         app._safe_get.assert_not_called()
         app.driver.execute_cdp_cmd.assert_not_called()
 
-    def test_send_mode_injects_cookie_after_authentication(self):
+    def test_send_mode_defers_cookie_injection_until_browser_needed(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
         app.mode, app.cookie = 'send', 'test=fixture'
         app._get_hl_count_api = MagicMock(return_value=25)
         app.driver = MagicMock()
         app.driver.execute_cdp_cmd.return_value = {'success': True}
         self.assertTrue(app.login())
+        app.driver.execute_cdp_cmd.assert_not_called()
+        app._ensure_browser_session()
         self.assertEqual(app.driver.execute_cdp_cmd.call_args.args[0], 'Network.setCookie')
+        app._ensure_browser_session()
+        app.driver.execute_cdp_cmd.assert_called_once()
 
     def test_exact_count_and_empty(self):
         parse = main.HuYaAuto._parse_inventory_response

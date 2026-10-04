@@ -18,6 +18,7 @@ class CoreTests(unittest.TestCase):
         app.mode, app.rooms = mode, [123, 456]
         app.inventory, app.submitted, app.outcome = None, 0, 'NOT_STARTED'
         app.driver = MagicMock()
+        app._ensure_browser_session = MagicMock()
         app.login = MagicMock(return_value=True)
         app.get_hl_count = MagicMock(return_value=count)
         app.send_to_room = MagicMock(return_value=0)
@@ -107,7 +108,7 @@ class CoreTests(unittest.TestCase):
         app._debug_capture = MagicMock()
         with patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError) as exc:
             main.HuYaAuto._get_hl_count_page(app)
-        self.assertEqual(exc.exception.code, 'INVENTORY_QUERY_FAILED')
+        self.assertEqual(exc.exception.code, 'INVENTORY_PAGE_UNAVAILABLE')
         self.assertEqual(app._safe_get.call_count, 2)
 
     def test_transport_timeout_retries_readonly_navigation(self):
@@ -204,6 +205,7 @@ class BrowserFixtureTests(unittest.TestCase):
         cls.app = main.HuYaAuto.__new__(main.HuYaAuto)
         cls.app.mode = 'diagnose'
         cls.app.driver = cls.app._init_browser()
+        cls.app._browser_authenticated = True
         cls.app._debug_capture = MagicMock()
 
     @classmethod

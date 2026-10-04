@@ -17,9 +17,15 @@ on:
           - send
         required: true
         default: diagnose
+      test_notice:
+        description: '仅 diagnose 模式可用：发送一条通知接入测试'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: huya-inventory-and-gifts
@@ -55,3 +61,26 @@ jobs:
           path: debug_artifacts/*.json
           if-no-files-found: ignore
           retention-days: 3
+      - name: 结果摘要与去重 Telegram 提醒
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          JOB_STATUS: ${{ job.status }}
+          TEST_NOTICE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'diagnose' && inputs.test_notice || false }}
+        run: |
+          if [ "$TEST_NOTICE" = "true" ]; then
+            python report.py --job-status "$JOB_STATUS" --test-notice
+          else
+            python report.py --job-status "$JOB_STATUS"
+          fi
+      - name: 保存通知状态（仅用于失败／恢复去重）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: huya-notification-state
+          path: notification_state/state.json
+          if-no-files-found: ignore
+          retention-days: 90

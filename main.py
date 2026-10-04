@@ -73,7 +73,9 @@ window.jQuery.ajaxPrefilter(function(options, original, xhr) {
         url.searchParams.get('do') !== 'listTotal') return;
     xhr.done(function(response) {
         const result = {loaded: true, valid: false, count: null};
-        if (response && Number(response.status) === 200 && response.data &&
+        if (response && Number.isInteger(response.status) && response.status >= 0 && response.status <= 9999)
+            result.business_status = response.status;
+        if (result.business_status === 200 && response.data &&
             Array.isArray(response.data.package) &&
             response.data.package.every(x => x && typeof x.cName === 'string' && x.cName.trim())) {
             const items = response.data.package.filter(x => x.cName === '虎粮');
@@ -88,8 +90,11 @@ window.jQuery.ajaxPrefilter(function(options, original, xhr) {
         }
         window.__huyaInventory = result;
     });
-    xhr.fail(function() {
-        window.__huyaInventory = {loaded: true, valid: false, count: null};
+    xhr.fail(function(xhr) {
+        const result = {loaded: true, valid: false, count: null, network_failed: true};
+        if (xhr && Number.isInteger(xhr.status) && xhr.status >= 100 && xhr.status <= 599)
+            result.http_status = xhr.status;
+        window.__huyaInventory = result;
     });
 });
 return true;
@@ -98,22 +103,59 @@ return true;
 
 class HuYaAuto:
     def __init__(self, mode='diagnose'):
-        if mode not in ('diagnose', 'send'):
-            raise HuyaError('CONFIG_ERROR', 'unknown mode')
-        self.mode = mode
-        self.cookie = os.getenv('HUYA_COOKIE', '').strip()
-        self.rooms = self._parse_rooms(os.getenv('HUYA_ROOMS', ''))
+        # Establish artifact state before validation. Neither diagnostics nor
+        # verified zero stock requires a browser/driver download.
+        self.mode = mode if mode in ('diagnose', 'send') else 'diagnose'
         self.outcome = 'NOT_STARTED'
         self.inventory = None
         self.submitted = 0
+        self.driver = None
+        self.wait = None
+        self._browser_authenticated = False
         self.debug_dir = Path(__file__).resolve().parent / 'debug_artifacts'
         self.debug_dir.mkdir(exist_ok=True, mode=0o700)
-        if not self.cookie:
-            raise HuyaError('CONFIG_ERROR', 'HUYA_COOKIE is required')
-        if mode == 'send' and not self.rooms:
-            raise HuyaError('CONFIG_ERROR', 'HUYA_ROOMS is required for sending')
-        self.driver = self._init_browser()
-        self.wait = WebDriverWait(self.driver, 15)
+        try:
+            if mode not in ('diagnose', 'send'):
+                raise HuyaError('CONFIG_ERROR', 'unknown mode')
+            self.cookie = os.getenv('HUYA_COOKIE', '').strip()
+            self.rooms = self._parse_rooms(os.getenv('HUYA_ROOMS', ''))
+            if not self.cookie:
+                raise HuyaError('CONFIG_ERROR', 'HUYA_COOKIE is required')
+            if mode == 'send' and not self.rooms:
+                raise HuyaError('CONFIG_ERROR', 'HUYA_ROOMS is required for sending')
+        except HuyaError as exc:
+            self.outcome = exc.code
+            self._try_record_result()
+            raise
+
+    def _ensure_browser(self):
+        if getattr(self, 'driver', None) is not None:
+            return
+        try:
+            self.driver = self._init_browser()
+            self.wait = WebDriverWait(self.driver, 15)
+        except Exception:
+            # Driver installation/start errors may contain private paths/URLs.
+            raise HuyaError('BROWSER_START_FAILED', 'browser could not be started') from None
+
+    def _ensure_browser_session(self):
+        self._ensure_browser()
+        if getattr(self, '_browser_authenticated', False):
+            return
+        injected = 0
+        for part in self.cookie.split(';'):
+            if '=' not in part:
+                continue
+            name, value = part.strip().split('=', 1)
+            result = self.driver.execute_cdp_cmd('Network.setCookie', {
+                'name': name.strip(), 'value': value.strip(),
+                'domain': '.huya.com', 'path': '/', 'secure': True,
+            })
+            injected += bool(result.get('success'))
+        if not injected:
+            raise HuyaError('LOGIN_UNCONFIRMED', 'browser cookie injection failed')
+        self._browser_authenticated = True
+        print(f'[COOKIE] browser injected_count={injected}')
 
     @staticmethod
     def _parse_rooms(value):
@@ -144,6 +186,7 @@ class HuYaAuto:
         driver_path = os.getenv('CHROMEDRIVER') or shutil.which('chromedriver')
         service = Service(driver_path or ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+        self.driver = driver  # Keep a partial startup available for run() cleanup.
         driver.set_page_load_timeout(12)
         driver.set_script_timeout(8)
         # Bound the transport as well as explicit waits when the renderer wedges.
@@ -227,27 +270,17 @@ class HuYaAuto:
         for attempt in range(1, 3):
             try:
                 self._get_hl_count_api()  # Rejects unauthenticated/malformed responses.
-                if self.mode == 'send':
-                    injected = 0
-                    for part in self.cookie.split(';'):
-                        if '=' not in part:
-                            continue
-                        name, value = part.strip().split('=', 1)
-                        result = self.driver.execute_cdp_cmd('Network.setCookie', {
-                            'name': name.strip(), 'value': value.strip(),
-                            'domain': '.huya.com', 'path': '/', 'secure': True,
-                        })
-                        injected += bool(result.get('success'))
-                    if not injected:
-                        raise HuyaError('LOGIN_UNCONFIRMED', 'browser cookie injection failed')
-                    print(f'[COOKIE] browser injected_count={injected}')
                 print('[LOGIN] authenticated inventory API confirmed')
                 return True
             except (requests.RequestException, ValueError, HuyaError, *DRIVER_ERRORS) as exc:
-                print(f'[LOGIN] API check attempt={attempt} error={type(exc).__name__}')
+                detail = f'{exc.code}: {exc}' if isinstance(exc, HuyaError) else type(exc).__name__
+                print(f'[LOGIN] API check attempt={attempt} error={detail}')
+                if isinstance(exc, HuyaError) and exc.code == 'LOGIN_REQUIRED':
+                    raise  # Retrying or a browser cannot fix explicit rejection.
                 if attempt < 2:
                     time.sleep(2)
         print('[LOGIN] API unverified; checking browser login')
+        self._ensure_browser()
         if not self._safe_get(cfg.URLS['user_index'], 'login_bootstrap'):
             raise HuyaError('LOGIN_PAGE_UNAVAILABLE', 'user page did not become ready')
         count = 0
@@ -266,28 +299,30 @@ class HuYaAuto:
         if not self._safe_get(cfg.URLS['user_index'], 'login_check', ready=marker):
             raise HuyaError('LOGIN_UNCONFIRMED', 'login marker missing; expired cookie or page failure')
         print('[LOGIN] confirmed (username not logged)')
+        self._browser_authenticated = True
         return True
 
     @staticmethod
     def _parse_inventory_response(response):
-        if (not isinstance(response, dict) or response.get('status') != 200 or
+        if (not isinstance(response, dict) or type(response.get('status')) is not int or
+                response['status'] != 200 or
                 not isinstance(response.get('data'), dict) or
                 not isinstance(response['data'].get('package'), list)):
-            raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory response invalid')
+            raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory response invalid')
         total = 0
         for item in response['data']['package']:
             if not isinstance(item, dict) or not isinstance(item.get('cName'), str) or not item['cName'].strip():
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory item malformed')
+                raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory item malformed')
             if item['cName'] != '虎粮':
                 continue
             value = item.get('num')
             if isinstance(value, str) and re.fullmatch(r'[0-9]+', value):
                 value = int(value)
             if type(value) is not int or value < 0 or value > 2**53 - 1:
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory count malformed')
+                raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory count malformed')
             total += value
         if total > 2**53 - 1:
-            raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory count out of range')
+            raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory count out of range')
         return total
 
     def _get_hl_count_api(self):
@@ -300,22 +335,54 @@ class HuYaAuto:
                     session.cookies.set(name.strip(), value.strip(), domain='.huya.com', path='/')
             session.headers.update({'Referer': cfg.URLS['pay_index'],
                                     'User-Agent': 'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36'})
-            url = 'https://q.huya.com/index.php'
-            signed = session.get(url, params={'m': 'PackageApi', 'do': 'getTimeSign'},
-                                 timeout=(8, 20), allow_redirects=False)
-            if signed.status_code != 200:
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory signing HTTP failure')
-            signed = signed.json()
-            if (not isinstance(signed, dict) or signed.get('status') != 200 or
-                    not isinstance(signed.get('data'), dict) or
+            signed = self._package_api_get(session, 'getTimeSign')
+            if (not isinstance(signed.get('data'), dict) or
                     not signed['data'].get('time') or not signed['data'].get('sign')):
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory signing rejected')
-            response = session.get(url, params={'m': 'PackageApi', 'do': 'listTotal',
-                'time': signed['data']['time'], 'sign': signed['data']['sign']},
-                timeout=(8, 20), allow_redirects=False)
-            if response.status_code != 200:
-                raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory HTTP failure')
-            return self._parse_inventory_response(response.json())
+                raise HuyaError('INVENTORY_RESPONSE_INVALID',
+                                'getTimeSign: HTTP 200; signing fields invalid')
+            response = self._package_api_get(session, 'listTotal', {
+                'time': signed['data']['time'], 'sign': signed['data']['sign']})
+            return self._parse_inventory_response(response)
+
+    @staticmethod
+    def _package_api_get(session, action, extra=None):
+        # Local constants/numeric statuses only: never upstream messages, bodies,
+        # signed URLs, credentials or transport exception text.
+        if action not in ('getTimeSign', 'listTotal'):
+            raise HuyaError('CONFIG_ERROR', 'read-only package action required')
+        params = dict(extra or {})
+        params.update({'m': 'PackageApi', 'do': action})
+        try:
+            response = session.get('https://q.huya.com/index.php', params=params,
+                                   timeout=(8, 20), allow_redirects=False)
+        except requests.Timeout:
+            raise HuyaError('INVENTORY_NETWORK_TIMEOUT', f'{action}: request failed') from None
+        except requests.exceptions.SSLError:
+            raise HuyaError('INVENTORY_TLS_FAILED', f'{action}: request failed') from None
+        except requests.RequestException:
+            raise HuyaError('INVENTORY_NETWORK_FAILED', f'{action}: request failed') from None
+        http = response.status_code
+        if type(http) is not int or not 100 <= http <= 599:
+            raise HuyaError('INVENTORY_RESPONSE_INVALID', f'{action}: invalid HTTP status')
+        if http != 200:
+            raise HuyaError('INVENTORY_HTTP_FAILED', f'{action}: HTTP {http}')
+        try:
+            payload = response.json()
+        except ValueError:
+            raise HuyaError('INVENTORY_RESPONSE_INVALID',
+                            f'{action}: HTTP 200; non-JSON response') from None
+        status = payload.get('status') if isinstance(payload, dict) else None
+        if type(status) is not int or not 0 <= status <= 9999:
+            raise HuyaError('INVENTORY_RESPONSE_INVALID',
+                            f'{action}: HTTP 200; invalid business status')
+        if status == 501:
+            # Only JSON 501 at HTTP 200 on these endpoints means not logged in.
+            raise HuyaError('LOGIN_REQUIRED',
+                            f'{action}: HTTP 200; business_status=501; login required')
+        if status != 200:
+            raise HuyaError('INVENTORY_API_REJECTED',
+                            f'{action}: HTTP 200; business_status={status}')
+        return payload
 
     def get_hl_count(self):
         for attempt in range(1, 3):
@@ -324,14 +391,19 @@ class HuYaAuto:
                 print(f'[INVENTORY] read-only API confirmed; ordinary_huliang={count}')
                 return count
             except (requests.RequestException, ValueError, HuyaError) as exc:
-                print(f'[INVENTORY] read-only API attempt={attempt} error={type(exc).__name__}')
+                detail = f'{exc.code}: {exc}' if isinstance(exc, HuyaError) else type(exc).__name__
+                print(f'[INVENTORY] read-only API attempt={attempt} error={detail}')
+                if isinstance(exc, HuyaError) and exc.code == 'LOGIN_REQUIRED':
+                    raise
                 if attempt < 2:
                     time.sleep(2)
         print('[INVENTORY] API unverified; trying browser inventory as fallback')
         return self._get_hl_count_page()
 
     def _get_hl_count_page(self):
+        self._ensure_browser_session()
         print('[INVENTORY] querying ordinary 虎粮')
+        failure = HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'inventory page did not become ready')
         for attempt in range(1, 3):
             try:
                 def ready(driver):
@@ -352,17 +424,37 @@ class HuYaAuto:
                     return result if result.get('loaded') else False
 
                 result = WebDriverWait(self.driver, 30, poll_frequency=0.5).until(inventory_loaded)
+                status = result.get('business_status')
+                if type(status) is int and 0 <= status <= 9999:
+                    if status == 501:
+                        raise HuyaError('LOGIN_REQUIRED', 'listTotal: browser business_status=501; login required')
+                    if status != 200:
+                        raise HuyaError('INVENTORY_API_REJECTED', f'listTotal: browser business_status={status}')
+                if result.get('network_failed'):
+                    http = result.get('http_status')
+                    if type(http) is int and 100 <= http <= 599:
+                        raise HuyaError('INVENTORY_HTTP_FAILED', f'listTotal: browser HTTP {http}')
+                    raise HuyaError('INVENTORY_NETWORK_FAILED', 'listTotal: browser request failed')
                 count = result.get('count')
-                if not result.get('valid') or type(count) is not int or count < 0:
-                    raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory response invalid')
+                if (type(status) is not int or status != 200 or not result.get('valid') or
+                        type(count) is not int or not 0 <= count <= 2**53 - 1):
+                    raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: browser inventory response invalid')
                 print(f'[INVENTORY] query confirmed; ordinary_huliang={count}')
                 return count
             except (*DRIVER_ERRORS, HuyaError) as exc:
-                print(f'[INVENTORY] failed attempt={attempt} error={type(exc).__name__}')
+                if isinstance(exc, HuyaError):
+                    failure = exc
+                    detail = f'{exc.code}: {exc}'
+                else:
+                    failure = HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'inventory page/response did not become ready')
+                    detail = type(exc).__name__
+                print(f'[INVENTORY] failed attempt={attempt} error={detail}')
+                if failure.code == 'LOGIN_REQUIRED':
+                    raise failure
                 self._debug_capture('inventory_query')
                 if attempt < 2:
                     time.sleep(2)
-        raise HuyaError('INVENTORY_QUERY_FAILED', 'inventory could not be verified; NOT zero stock')
+        raise failure
 
     def _gift_result(self):
         result = self.driver.execute_script('return window.__huyaGiftResult || {status:"pending"}')
@@ -395,6 +487,7 @@ class HuYaAuto:
             raise HuyaError('SEND_DISABLED', 'diagnose mode cannot call gift delivery')
         if count <= 0:
             return 0
+        self._ensure_browser_session()
         try:
             room_ready = lambda driver: driver.execute_script(
                 'return Boolean(document.body.dataset.lp && document.body.dataset.gid)')
@@ -428,6 +521,12 @@ class HuYaAuto:
         (self.debug_dir / 'result.json').write_text(json.dumps(data, ensure_ascii=False, indent=2))
         print('[RESULT] ' + json.dumps(data, ensure_ascii=False))
 
+    def _try_record_result(self):
+        try:
+            self._record_result()
+        except Exception as exc:
+            print('[RESULT] record failed: ' + type(exc).__name__)
+
     def run(self):
         ok = False
         try:
@@ -442,6 +541,7 @@ class HuYaAuto:
                 print('[INVENTORY] verified empty; nothing to send')
                 ok = True
             else:
+                self._ensure_browser_session()
                 per, remainder = divmod(self.inventory, len(self.rooms))
                 for index, room in enumerate(self.rooms):
                     self.submitted += self.send_to_room(room, per + (index < remainder))
@@ -455,14 +555,12 @@ class HuYaAuto:
             self.outcome = 'UNEXPECTED_ERROR'
             print('[ERROR] unexpected ' + type(exc).__name__)
         finally:
-            try:
-                self._record_result()
-            except Exception as exc:
-                print('[RESULT] record failed: ' + type(exc).__name__)
-            try:
-                self.driver.quit()
-            except Exception:
-                print('[EXIT] browser cleanup failed')
+            self._try_record_result()
+            if getattr(self, 'driver', None) is not None:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    print('[EXIT] browser cleanup failed')
         return ok
 
 
