@@ -13,6 +13,12 @@ assert spec is not None and spec.loader is not None
 report=importlib.util.module_from_spec(spec);spec.loader.exec_module(report)
 
 class ReportTests(unittest.TestCase):
+    def test_cross_host_redirect_strips_authorization(self):
+        import urllib.request
+        req=urllib.request.Request('https://api.github.com/artifact',headers={'Authorization':'Bearer sentinel'})
+        new=report.SafeRedirect().redirect_request(req,None,302,'Found',{},'https://storage.example/object')
+        self.assertFalse(new.has_header('Authorization'))
+
     def test_incident_transitions(self):
         good={'outcome':'DIAGNOSE_OK'};bad={'outcome':'LOGIN_REQUIRED'}
         self.assertIsNone(report.notice_kind(None,good))

@@ -42,13 +42,25 @@ def notice_kind(previous, current):
     if healthy and not previous.get('healthy', True): return 'recovery'
     return None
 
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            # GitHub artifact downloads redirect to signed object storage.
+            # Never forward the GitHub credential to a different host.
+            from urllib.parse import urlsplit
+            if urlsplit(req.full_url).netloc != urlsplit(newurl).netloc:
+                redirected.remove_header('Authorization')
+        return redirected
+
 def github(path):
     repo = os.environ['GITHUB_REPOSITORY']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo): raise ValueError()
     req = urllib.request.Request('https://api.github.com/repos/'+repo+path, headers={
         'Authorization': 'Bearer '+os.environ['GITHUB_TOKEN'],
         'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
-    with urllib.request.urlopen(req, timeout=20) as response: return response.read()
+    opener = urllib.request.build_opener(SafeRedirect())
+    with opener.open(req, timeout=20) as response: return response.read()
 
 def previous_state():
     data = json.loads(github('/actions/artifacts?name=huya-notification-state&per_page=100'))
