@@ -3,7 +3,7 @@ on:
   pull_request:
     branches: [master]
   push:
-    branches: ['fix/huliang-0040-superfans-998']
+    branches: ['fix/**']
 permissions:
   contents: read
 jobs:

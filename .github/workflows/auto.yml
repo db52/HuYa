@@ -69,10 +69,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
           JOB_STATUS: ${{ job.status }}
+          ALL_RESULTS: ${{ github.event_name == 'schedule' || inputs.mode == 'send' }}
+          HUYA_REPORT_ROOMS: ${{ github.event_name == 'schedule' && '998' || inputs.rooms || '998' }}
           TEST_NOTICE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'diagnose' && inputs.test_notice || false }}
         run: |
           if [ "$TEST_NOTICE" = "true" ]; then
             python report.py --job-status "$JOB_STATUS" --test-notice
+          elif [ "$ALL_RESULTS" = "true" ]; then
+            python report.py --job-status "$JOB_STATUS" --all-results
           else
             python report.py --job-status "$JOB_STATUS"
           fi

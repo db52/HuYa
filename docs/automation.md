@@ -8,6 +8,8 @@
 
 `result.json` 保留普通字段 `ordinary_huliang`、`submitted`，新增 `super_fans_huliang`、`super_fans_submitted`。旧结果缺少超粉字段时摘要显示未知，不伪造为零。
 
+每次定时或手动 send 任务均向 Telegram「告警」话题 7388 发送一条两类库存、已确认赠送数量和运行链接；包括库存为空与失败。普通 diagnose 仍按失败／恢复去重，显式 test_notice 才发只读测试。通知不明不重试，同一 run 已尝试通知时不重复发送；历史查询失败保守停止通知。
+
 PR 的安全测试不读取账号 Cookie，浏览器测试仅访问 localhost 礼物页面 fixture，不发生虎牙真实赠送。完整测试命令：
 
 ```bash
