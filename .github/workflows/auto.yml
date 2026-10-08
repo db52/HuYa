@@ -2,13 +2,13 @@ name: 虎牙虎粮自动发放
 
 on:
   schedule:
-    - cron: '1 16 * * *'  # 北京时间 00:01；仅默认分支调度
+    - cron: '40 16 * * *'  # 北京时间 00:40；仅默认分支调度，GitHub 可能延迟触发
   workflow_dispatch:
     inputs:
       rooms:
-        description: '房间号，逗号分隔（诊断可留空）'
+        description: '手动操作的房间号；定时任务固定送到 998'
         required: false
-        default: ''
+        default: '998'
       mode:
         description: 'diagnose 仅验证登录和库存，不发送礼物'
         type: choice
@@ -48,7 +48,7 @@ jobs:
       - name: 验证登录与库存 / 显式赠送
         env:
           HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
-          HUYA_ROOMS: ${{ inputs.rooms || secrets.HUYA_ROOMS }}
+          HUYA_ROOMS: ${{ github.event_name == 'schedule' && '998' || inputs.rooms || '998' }}
           HUYA_MODE: ${{ github.event_name == 'schedule' && 'send' || inputs.mode || 'diagnose' }}
           HEADLESS: 'true'
           PYTHONUNBUFFERED: '1'

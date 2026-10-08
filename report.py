@@ -25,12 +25,15 @@ def safe_result(path):
         value = json.loads(Path(path).read_text())
         if not isinstance(value, dict): raise ValueError()
     except (OSError, ValueError):
-        return {'mode': 'unknown', 'outcome': 'WORKFLOW_FAILED', 'ordinary_huliang': None, 'submitted': None}
+        return {'mode': 'unknown', 'outcome': 'WORKFLOW_FAILED', 'ordinary_huliang': None, 'submitted': None,
+                'super_fans_huliang': None, 'super_fans_submitted': None}
     return {
         'mode': value.get('mode') if value.get('mode') in ('send', 'diagnose') else 'unknown',
         'outcome': value.get('outcome') if value.get('outcome') in OUTCOMES else 'WORKFLOW_FAILED',
         'ordinary_huliang': value.get('ordinary_huliang') if type(value.get('ordinary_huliang')) is int and 0 <= value['ordinary_huliang'] <= 2**53-1 else None,
         'submitted': value.get('submitted') if type(value.get('submitted')) is int and 0 <= value['submitted'] <= 2**53-1 else None,
+        'super_fans_huliang': value.get('super_fans_huliang') if type(value.get('super_fans_huliang')) is int and 0 <= value['super_fans_huliang'] <= 2**53-1 else None,
+        'super_fans_submitted': value.get('super_fans_submitted') if type(value.get('super_fans_submitted')) is int and 0 <= value['super_fans_submitted'] <= 2**53-1 else None,
     }
 
 def notice_kind(previous, current):
@@ -100,7 +103,9 @@ def summarize(current, run_url):
     text = '\n'.join(['## 虎牙任务结果',
         '- 模式：`'+current['mode']+'`', '- 结果：`'+current['outcome']+'`',
         '- 普通虎粮库存：'+str(current['ordinary_huliang']),
-        '- 已确认送出数量：'+str(current['submitted']),
+        '- 普通虎粮已确认送出：'+str(current['submitted']),
+        '- 超粉虎粮库存：'+str(current.get('super_fans_huliang')),
+        '- 超粉虎粮已确认送出：'+str(current.get('super_fans_submitted')),
         '- diagnose 不送礼；结果未知时不要盲目重跑。',
         '[运行记录]('+run_url+')', ''])
     path=os.environ.get('GITHUB_STEP_SUMMARY')
@@ -132,7 +137,11 @@ def main():
     state={'healthy':current['outcome'] in GOOD,'outcome':current['outcome'],'run_id':int(run)}
     if kind:
         titles={'failure':'虎牙任务失败','changed_failure':'虎牙失败原因变化','recovery':'虎牙任务恢复'}
-        message=titles[kind]+'\n结果：'+current['outcome']+'\n模式：'+current['mode']+'\n已确认送出数量：'+str(current['submitted'])+'\n'+url
+        message=(titles[kind]+'\n结果：'+current['outcome']+'\n模式：'+current['mode']+
+                 '\n普通虎粮库存：'+str(current['ordinary_huliang'])+
+                 '\n普通虎粮已确认送出：'+str(current['submitted'])+
+                 '\n超粉虎粮库存：'+str(current['super_fans_huliang'])+
+                 '\n超粉虎粮已确认送出：'+str(current['super_fans_submitted'])+'\n'+url)
         if current['outcome']=='DIAGNOSE_OK':message+='\n登录和库存查询恢复，未验证实际送礼。'
         if current['outcome']=='SEND_FAILED_OR_UNKNOWN':message+='\n可能存在未确认提交，请勿直接重跑送礼。'
         try:send_notice(message)

@@ -7,7 +7,7 @@ class InventoryApiTests(unittest.TestCase):
     def test_authenticated_api_login_does_not_open_user_page(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
         app.mode = 'diagnose'
-        app._get_hl_count_api = MagicMock(return_value=25)
+        app._get_inventory_api = MagicMock(return_value={'ordinary': 25, 'super_fans': 0})
         app._safe_get = MagicMock()
         app.driver = MagicMock()
         self.assertTrue(app.login())
@@ -17,7 +17,7 @@ class InventoryApiTests(unittest.TestCase):
     def test_send_mode_defers_cookie_injection_until_browser_needed(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
         app.mode, app.cookie = 'send', 'test=fixture'
-        app._get_hl_count_api = MagicMock(return_value=25)
+        app._get_inventory_api = MagicMock(return_value={'ordinary': 25, 'super_fans': 0})
         app.driver = MagicMock()
         app.driver.execute_cdp_cmd.return_value = {'success': True}
         self.assertTrue(app.login())
@@ -30,8 +30,8 @@ class InventoryApiTests(unittest.TestCase):
     def test_exact_count_and_empty(self):
         parse = main.HuYaAuto._parse_inventory_response
         def response(items): return {'status': 200, 'data': {'package': items}}
-        self.assertEqual(parse(response([])), 0)
-        self.assertEqual(parse(response([{'cName': '虎粮', 'num': '25'}, {'cName': '超粉虎粮', 'num': 90}])), 25)
+        self.assertEqual(parse(response([])), {'ordinary': 0, 'super_fans': 0})
+        self.assertEqual(parse(response([{'cName': '虎粮', 'num': '25'}, {'cName': '超粉虎粮', 'num': 90}])), {'ordinary': 25, 'super_fans': 90})
         for bad in (None, '', True, False, -1, 1.5, '１２', '2e3'):
             with self.subTest(bad=bad), self.assertRaises(main.HuyaError):
                 parse(response([{'cName': '虎粮', 'num': bad}]))
@@ -44,11 +44,12 @@ class InventoryApiTests(unittest.TestCase):
         first = MagicMock(status_code=200)
         first.json.return_value = {'status': 200, 'data': {'time': 123, 'sign': 'fixture-not-real'}}
         second = MagicMock(status_code=200)
-        second.json.return_value = {'status': 200, 'data': {'package': [{'cName': '虎粮', 'num': 25}]}}
+        second.json.return_value = {'status': 200, 'data': {'package': [
+            {'cName': '虎粮', 'num': 25}, {'cName': '超粉虎粮', 'num': '10'}]}}
         with patch.object(main.requests, 'Session') as cls:
             session = cls.return_value.__enter__.return_value
             session.get.side_effect = [first, second]
-            self.assertEqual(app._get_hl_count_api(), 25)
+            self.assertEqual(app._get_inventory_api(), {'ordinary': 25, 'super_fans': 10})
             calls = session.get.call_args_list
             self.assertEqual(len(calls), 2)
             self.assertEqual([c.kwargs['params']['do'] for c in calls], ['getTimeSign', 'listTotal'])
@@ -59,16 +60,16 @@ class InventoryApiTests(unittest.TestCase):
 
     def test_api_success_skips_browser_fallback(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
-        app._get_hl_count_api = MagicMock(return_value=0)
-        app._get_hl_count_page = MagicMock()
+        app._get_inventory_api = MagicMock(return_value={'ordinary': 0, 'super_fans': 0})
+        app._get_inventory_page = MagicMock()
         self.assertEqual(app.get_hl_count(), 0)
-        app._get_hl_count_page.assert_not_called()
+        app._get_inventory_page.assert_not_called()
 
     def test_api_failure_falls_back_bounded(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
-        app._get_hl_count_api = MagicMock(side_effect=main.requests.Timeout())
-        app._get_hl_count_page = MagicMock(return_value=25)
+        app._get_inventory_api = MagicMock(side_effect=main.requests.Timeout())
+        app._get_inventory_page = MagicMock(return_value={'ordinary': 25, 'super_fans': 0})
         with patch.object(main.time, 'sleep'):
             self.assertEqual(app.get_hl_count(), 25)
-        self.assertEqual(app._get_hl_count_api.call_count, 2)
-        app._get_hl_count_page.assert_called_once()
+        self.assertEqual(app._get_inventory_api.call_count, 2)
+        app._get_inventory_page.assert_called_once()

@@ -33,7 +33,7 @@ class ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'result.json';p.write_text(json.dumps({'mode':'SECRET_COOKIE','outcome':'COOKIE=secret','ordinary_huliang':True,'submitted':-1,'cookie':'secret'}))
             r=report.safe_result(p)
-            self.assertEqual(r,{'mode':'unknown','outcome':'WORKFLOW_FAILED','ordinary_huliang':None,'submitted':None})
+            self.assertEqual(r,{'mode':'unknown','outcome':'WORKFLOW_FAILED','ordinary_huliang':None,'submitted':None,'super_fans_huliang':None,'super_fans_submitted':None})
             self.assertNotIn('secret',json.dumps(r))
             p.write_text('[]');self.assertEqual(report.safe_result(p)['outcome'],'WORKFLOW_FAILED')
 
