@@ -20,7 +20,7 @@ class CoreTests(unittest.TestCase):
         app.driver = MagicMock()
         app._ensure_browser_session = MagicMock()
         app.login = MagicMock(return_value=True)
-        app.get_hl_count = MagicMock(return_value=count)
+        app.get_inventory = MagicMock(return_value={'ordinary': count, 'super_fans': 0})
         app.send_to_room = MagicMock(return_value=0)
         app._record_result = MagicMock()
         return app
@@ -40,7 +40,7 @@ class CoreTests(unittest.TestCase):
 
     def test_query_error_is_not_zero(self):
         app = self.make_app()
-        app.get_hl_count.side_effect = main.HuyaError('INVENTORY_QUERY_FAILED', 'NOT zero stock')
+        app.get_inventory.side_effect = main.HuyaError('INVENTORY_QUERY_FAILED', 'NOT zero stock')
         self.assertFalse(app.run())
         self.assertIsNone(app.inventory)
         self.assertEqual(app.outcome, 'INVENTORY_QUERY_FAILED')
@@ -50,12 +50,12 @@ class CoreTests(unittest.TestCase):
         app = self.make_app()
         app.login.side_effect = main.HuyaError('LOGIN_UNCONFIRMED', 'missing')
         self.assertFalse(app.run())
-        app.get_hl_count.assert_not_called()
+        app.get_inventory.assert_not_called()
 
     def test_direct_send_guard_before_navigation(self):
         app = self.make_app()
         with self.assertRaises(main.HuyaError):
-            main.HuYaAuto.send_to_room(app, 123, 1)
+            main.HuYaAuto.send_to_room(app, 123, 1, gift_name='虎粮')
         app.driver.get.assert_not_called()
 
     def test_direct_submit_guard(self):
@@ -72,7 +72,7 @@ class CoreTests(unittest.TestCase):
     def test_send_requires_inventory_postcondition(self):
         app = self.make_app(mode='send')
         app.send_to_room.side_effect = [13, 12]
-        app.get_hl_count.side_effect = [25, 25]
+        app.get_inventory.side_effect = [dict(ordinary=25, super_fans=0), dict(ordinary=25, super_fans=0)]
         self.assertFalse(app.run())
         self.assertEqual(app.outcome, 'SEND_FAILED_OR_UNKNOWN')
 

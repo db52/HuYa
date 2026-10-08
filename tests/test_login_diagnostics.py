@@ -27,7 +27,7 @@ class LoginDiagnosticTests(unittest.TestCase):
             session = cls.return_value.__enter__.return_value
             session.get.return_value = response
             with self.assertRaises(main.HuyaError) as caught:
-                app._get_hl_count_api()
+                app._get_inventory_api()
             self.assertEqual(caught.exception.code, expected_code)
             self.assertEqual(str(caught.exception), expected_detail)
             session.get.assert_called_once()
@@ -86,7 +86,7 @@ class LoginDiagnosticTests(unittest.TestCase):
                 session = cls.return_value.__enter__.return_value
                 session.get.side_effect = [first, response]
                 with self.assertRaises(main.HuyaError) as caught:
-                    self.make_app()._get_hl_count_api()
+                    self.make_app()._get_inventory_api()
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(str(caught.exception), detail)
                 self.assertEqual(session.get.call_count, 2)
@@ -115,7 +115,7 @@ class LoginDiagnosticTests(unittest.TestCase):
                 session = cls.return_value.__enter__.return_value
                 session.get.side_effect = error
                 with self.assertRaises(main.HuyaError) as caught:
-                    self.make_app()._get_hl_count_api()
+                    self.make_app()._get_inventory_api()
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(str(caught.exception), 'getTimeSign: request failed')
                 self.assertIsNone(caught.exception.__cause__)
@@ -128,20 +128,20 @@ class LoginDiagnosticTests(unittest.TestCase):
             session = cls.return_value.__enter__.return_value
             session.get.side_effect = [first, second]
             with self.assertRaises(main.HuyaError) as caught:
-                app._get_hl_count_api()
+                app._get_inventory_api()
             self.assertEqual(caught.exception.code, 'LOGIN_REQUIRED')
             self.assertEqual(str(caught.exception), 'listTotal: HTTP 200; business_status=501; login required')
             self.assertEqual(session.get.call_count, 2)
 
     def test_confirmed_login_rejection_stops_without_retry_or_browser(self):
         app = self.make_app()
-        app._get_hl_count_api = MagicMock(side_effect=main.HuyaError(
+        app._get_inventory_api = MagicMock(side_effect=main.HuyaError(
             'LOGIN_REQUIRED', 'getTimeSign: HTTP 200; business_status=501; login required'))
         with contextlib.redirect_stdout(io.StringIO()) as out, patch.object(main.time, 'sleep') as sleep:
             with self.assertRaises(main.HuyaError) as caught:
                 app.login()
         self.assertEqual(caught.exception.code, 'LOGIN_REQUIRED')
-        app._get_hl_count_api.assert_called_once()
+        app._get_inventory_api.assert_called_once()
         app._safe_get.assert_not_called()
         app.driver.execute_cdp_cmd.assert_not_called()
         sleep.assert_not_called()
@@ -151,26 +151,26 @@ class LoginDiagnosticTests(unittest.TestCase):
 
     def test_expired_login_during_inventory_does_not_fallback(self):
         app = self.make_app()
-        app._get_hl_count_api = MagicMock(side_effect=main.HuyaError('LOGIN_REQUIRED', 'listTotal: login required'))
-        app._get_hl_count_page = MagicMock()
+        app._get_inventory_api = MagicMock(side_effect=main.HuyaError('LOGIN_REQUIRED', 'listTotal: login required'))
+        app._get_inventory_page = MagicMock()
         with self.assertRaises(main.HuyaError):
             app.get_hl_count()
-        app._get_hl_count_api.assert_called_once()
-        app._get_hl_count_page.assert_not_called()
+        app._get_inventory_api.assert_called_once()
+        app._get_inventory_page.assert_not_called()
 
     def test_send_run_with_rejected_login_never_queries_or_sends(self):
         app = self.make_app()
         app.mode, app.rooms = 'send', [123]
         app.inventory, app.submitted, app.outcome = None, 0, 'NOT_STARTED'
-        app._get_hl_count_api = MagicMock(side_effect=main.HuyaError('LOGIN_REQUIRED', 'login required'))
-        app.get_hl_count = MagicMock()
+        app._get_inventory_api = MagicMock(side_effect=main.HuyaError('LOGIN_REQUIRED', 'login required'))
+        app.get_inventory = MagicMock()
         app.send_to_room = MagicMock()
         app._record_result = MagicMock()
         self.assertFalse(app.run())
         self.assertEqual(app.outcome, 'LOGIN_REQUIRED')
         self.assertIsNone(app.inventory)
         self.assertEqual(app.submitted, 0)
-        app.get_hl_count.assert_not_called()
+        app.get_inventory.assert_not_called()
         app.send_to_room.assert_not_called()
         app.driver.quit.assert_called_once()
 

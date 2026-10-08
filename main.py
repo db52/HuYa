@@ -27,6 +27,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 import config as cfg
 
 DRIVER_ERRORS = (WebDriverException, TransportError, TimeoutError, ConnectionError)
+GIFTS = {'ordinary': '虎粮', 'super_fans': '超粉虎粮'}
+MAX_COUNT = 2**53 - 1
 
 PACK_READY = r"""
 const jq = window.jQuery;
@@ -72,21 +74,22 @@ window.jQuery.ajaxPrefilter(function(options, original, xhr) {
     if (url.searchParams.get('m') !== 'PackageApi' ||
         url.searchParams.get('do') !== 'listTotal') return;
     xhr.done(function(response) {
-        const result = {loaded: true, valid: false, count: null};
+        const result = {loaded: true, valid: false, counts: null};
         if (response && Number.isInteger(response.status) && response.status >= 0 && response.status <= 9999)
             result.business_status = response.status;
         if (result.business_status === 200 && response.data &&
             Array.isArray(response.data.package) &&
             response.data.package.every(x => x && typeof x.cName === 'string' && x.cName.trim())) {
-            const items = response.data.package.filter(x => x.cName === '虎粮');
-            const counts = items.map(x =>
-                (typeof x.num === 'number' || (typeof x.num === 'string' && /^\d+$/.test(x.num)))
-                    ? Number(x.num) : NaN);
-            if (counts.every(x => Number.isSafeInteger(x) && x >= 0)) {
-                result.valid = true;
-                result.count = counts.reduce((a, b) => a + b, 0);
-                if (!Number.isSafeInteger(result.count)) result.valid = false;
-            }
+            const counts = {ordinary: 0, super_fans: 0};
+            result.valid = response.data.package.every(x => {
+                const n = (typeof x.num === 'number' ||
+                    (typeof x.num === 'string' && /^[0-9]+$/.test(x.num))) ? Number(x.num) : NaN;
+                if (!Number.isSafeInteger(n) || n < 0) return false;
+                const key = x.cName === '虎粮' ? 'ordinary' : x.cName === '超粉虎粮' ? 'super_fans' : null;
+                if (key) counts[key] += n;
+                return Object.values(counts).every(Number.isSafeInteger);
+            });
+            if (result.valid) result.counts = counts;
         }
         window.__huyaInventory = result;
     });
@@ -109,6 +112,8 @@ class HuYaAuto:
         self.outcome = 'NOT_STARTED'
         self.inventory = None
         self.submitted = 0
+        self.super_fans_inventory = None
+        self.super_fans_submitted = 0
         self.driver = None
         self.wait = None
         self._browser_authenticated = False
@@ -269,7 +274,7 @@ class HuYaAuto:
         print('[LOGIN] checking authenticated read-only inventory first')
         for attempt in range(1, 3):
             try:
-                self._get_hl_count_api()  # Rejects unauthenticated/malformed responses.
+                self._authenticated_inventory = self._validate_inventory(self._get_inventory_api())
                 print('[LOGIN] authenticated inventory API confirmed')
                 return True
             except (requests.RequestException, ValueError, HuyaError, *DRIVER_ERRORS) as exc:
@@ -309,23 +314,23 @@ class HuYaAuto:
                 not isinstance(response.get('data'), dict) or
                 not isinstance(response['data'].get('package'), list)):
             raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory response invalid')
-        total = 0
+        totals = dict.fromkeys(GIFTS, 0)
         for item in response['data']['package']:
             if not isinstance(item, dict) or not isinstance(item.get('cName'), str) or not item['cName'].strip():
                 raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory item malformed')
-            if item['cName'] != '虎粮':
-                continue
             value = item.get('num')
             if isinstance(value, str) and re.fullmatch(r'[0-9]+', value):
                 value = int(value)
             if type(value) is not int or value < 0 or value > 2**53 - 1:
                 raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory count malformed')
-            total += value
-        if total > 2**53 - 1:
-            raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory count out of range')
-        return total
+            for key, name in GIFTS.items():
+                if item['cName'] == name:
+                    totals[key] += value
+                    if totals[key] > MAX_COUNT:
+                        raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: HTTP 200; inventory count out of range')
+        return totals
 
-    def _get_hl_count_api(self):
+    def _get_inventory_api(self):
         # Same two GET endpoints used by pay/js/mainv2.js handlePackage().
         # No payment/gift endpoint; redirects rejected; cookies scoped to Huya.
         with requests.Session() as session:
@@ -384,12 +389,33 @@ class HuYaAuto:
                             f'{action}: HTTP 200; business_status={status}')
         return payload
 
+    @staticmethod
+    def _validate_inventory(counts):
+        if (not isinstance(counts, dict) or set(counts) != set(GIFTS) or
+                any(type(n) is not int or not 0 <= n <= MAX_COUNT for n in counts.values())):
+            raise HuyaError('INVENTORY_RESPONSE_INVALID', 'inventory snapshot invalid')
+        return dict(counts)
+
+    def _get_hl_count_api(self):
+        """Legacy ordinary-only projection of a single full API snapshot."""
+        return self._get_inventory_api()['ordinary']
+
     def get_hl_count(self):
+        """Legacy ordinary-only projection; delivery always uses get_inventory."""
+        return self.get_inventory()['ordinary']
+
+    def get_inventory(self):
+        # Login's authenticated snapshot is also the initial stock read, not a
+        # second request that could disagree. Every later read is independent.
+        if hasattr(self, '_authenticated_inventory'):
+            counts = self._authenticated_inventory
+            del self._authenticated_inventory
+            return self._validate_inventory(counts)
         for attempt in range(1, 3):
             try:
-                count = self._get_hl_count_api()
-                print(f'[INVENTORY] read-only API confirmed; ordinary_huliang={count}')
-                return count
+                counts = self._validate_inventory(self._get_inventory_api())
+                print(f'[INVENTORY] read-only API confirmed; ordinary_huliang={counts["ordinary"]}; super_fans_huliang={counts["super_fans"]}')
+                return counts
             except (requests.RequestException, ValueError, HuyaError) as exc:
                 detail = f'{exc.code}: {exc}' if isinstance(exc, HuyaError) else type(exc).__name__
                 print(f'[INVENTORY] read-only API attempt={attempt} error={detail}')
@@ -398,11 +424,14 @@ class HuYaAuto:
                 if attempt < 2:
                     time.sleep(2)
         print('[INVENTORY] API unverified; trying browser inventory as fallback')
-        return self._get_hl_count_page()
+        return self._get_inventory_page()
 
     def _get_hl_count_page(self):
+        return self._get_inventory_page()['ordinary']
+
+    def _get_inventory_page(self):
         self._ensure_browser_session()
-        print('[INVENTORY] querying ordinary 虎粮')
+        print('[INVENTORY] querying 虎粮 and 超粉虎粮 in one snapshot')
         failure = HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'inventory page did not become ready')
         for attempt in range(1, 3):
             try:
@@ -435,12 +464,11 @@ class HuYaAuto:
                     if type(http) is int and 100 <= http <= 599:
                         raise HuyaError('INVENTORY_HTTP_FAILED', f'listTotal: browser HTTP {http}')
                     raise HuyaError('INVENTORY_NETWORK_FAILED', 'listTotal: browser request failed')
-                count = result.get('count')
-                if (type(status) is not int or status != 200 or not result.get('valid') or
-                        type(count) is not int or not 0 <= count <= 2**53 - 1):
+                if (type(status) is not int or status != 200 or result.get('valid') is not True):
                     raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: browser inventory response invalid')
-                print(f'[INVENTORY] query confirmed; ordinary_huliang={count}')
-                return count
+                counts = self._validate_inventory(result.get('counts'))
+                print(f'[INVENTORY] query confirmed; ordinary_huliang={counts["ordinary"]}; super_fans_huliang={counts["super_fans"]}')
+                return counts
             except (*DRIVER_ERRORS, HuyaError) as exc:
                 if isinstance(exc, HuyaError):
                     failure = exc
@@ -482,9 +510,11 @@ class HuYaAuto:
             WebDriverWait(self.driver, 25, poll_frequency=0.2).until(lambda _: self._gift_result())
         print('[SEND] fresh business success confirmed')
 
-    def send_to_room(self, room_id, count):
+    def send_to_room(self, room_id, count, *, gift_name):
         if self.mode != 'send':
             raise HuyaError('SEND_DISABLED', 'diagnose mode cannot call gift delivery')
+        if gift_name not in GIFTS.values() or type(count) is not int or not 0 <= count <= MAX_COUNT:
+            raise HuyaError('CONFIG_ERROR', 'unsupported gift or invalid count')
         if count <= 0:
             return 0
         self._ensure_browser_session()
@@ -498,18 +528,37 @@ class HuYaAuto:
             if not self._safe_get(cfg.URLS['gift_tab'].format(lp=lp, gid=gid), 'gift_page', ready=gift_ready):
                 raise HuyaError('SEND_PREPARATION_FAILED', 'gift page unavailable')
             items = self.driver.find_elements(By.CLASS_NAME, cfg.GIFT['item_class'])
-            ordinary = [item for item in items if re.search(r'(?:^|\s)虎粮(?:\s|$)', item.text)]
-            if len(ordinary) != 1:
-                raise HuyaError('GIFT_AMBIGUOUS', 'ordinary gift missing or ambiguous')
-            ActionChains(self.driver).move_to_element(ordinary[0]).pause(1).perform()
-            inp = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, cfg.GIFT['input_css'])))
+            pattern = r'\A' + re.escape(gift_name) + r'\Z'
+            selected = []
+            for item in items:
+                names = item.find_elements(By.CSS_SELECTOR, ':scope > p')
+                if len(names) == 1 and re.fullmatch(pattern, names[0].text):
+                    selected.append(item)
+            if len(selected) != 1:
+                raise HuyaError('GIFT_AMBIGUOUS', 'requested gift missing or ambiguous')
+            ActionChains(self.driver).move_to_element(selected[0]).pause(1).perform()
+            def selected_input(driver):
+                # WebPackageV2 displays the active item's name in the hover
+                # popup. Exclude its child price span, not part of the name.
+                names = driver.execute_script("""
+                    return Array.from(document.querySelectorAll('.g-present-content .present-info > .c-name'))
+                        .map(p => Array.from(p.childNodes).filter(n => n.nodeType === Node.TEXT_NODE)
+                            .map(n => n.textContent).join(''));
+                """)
+                if names != [gift_name]:
+                    return False
+                return EC.element_to_be_clickable((By.CSS_SELECTOR,
+                    '.g-present-content ' + cfg.GIFT['input_css']))(driver)
+            inp = self.wait.until(selected_input)
             inp.click()
             inp.clear()
             inp.send_keys(str(count))
             if inp.get_attribute('value') != str(count):
                 raise HuyaError('SEND_PREPARATION_FAILED', 'gift count did not match requested value')
+            if not selected_input(self.driver):
+                raise HuyaError('SEND_PREPARATION_FAILED', 'selected gift identity changed')
             self._submit_gift()
-            print(f'[SEND] confirmed count={count}')
+            print(f'[SEND] confirmed gift={gift_name}; count={count}')
             return count
         except Exception as exc:
             self._debug_capture('send_failed_or_unknown')
@@ -517,7 +566,9 @@ class HuYaAuto:
 
     def _record_result(self):
         data = {'mode': self.mode, 'outcome': self.outcome,
-                'ordinary_huliang': self.inventory, 'submitted': self.submitted}
+                'ordinary_huliang': self.inventory, 'submitted': self.submitted,
+                'super_fans_huliang': self.super_fans_inventory,
+                'super_fans_submitted': self.super_fans_submitted}
         (self.debug_dir / 'result.json').write_text(json.dumps(data, ensure_ascii=False, indent=2))
         print('[RESULT] ' + json.dumps(data, ensure_ascii=False))
 
@@ -531,22 +582,41 @@ class HuYaAuto:
         ok = False
         try:
             self.login()
-            self.inventory = self.get_hl_count()
+            stock = self._validate_inventory(self.get_inventory())
+            self.inventory = stock['ordinary']
+            self.super_fans_inventory = stock['super_fans']
+            self.super_fans_submitted = 0
             if self.mode == 'diagnose':
                 self.outcome = 'DIAGNOSE_OK'
                 print('[DIAGNOSE] login and inventory verified; gift delivery disabled')
                 ok = True
-            elif self.inventory == 0:
+            elif not any(stock.values()):
                 self.outcome = 'EMPTY_STOCK'
                 print('[INVENTORY] verified empty; nothing to send')
                 ok = True
             else:
                 self._ensure_browser_session()
-                per, remainder = divmod(self.inventory, len(self.rooms))
-                for index, room in enumerate(self.rooms):
-                    self.submitted += self.send_to_room(room, per + (index < remainder))
-                remaining = self.get_hl_count()
-                ok = self.submitted == self.inventory and remaining == 0
+                expected = dict(stock)
+                remaining = dict(stock)
+                for key, gift_name in GIFTS.items():
+                    if stock[key] == 0:
+                        continue
+                    per, remainder = divmod(stock[key], len(self.rooms))
+                    field = 'submitted' if key == 'ordinary' else 'super_fans_submitted'
+                    for index, room in enumerate(self.rooms):
+                        count = per + int(index < remainder)
+                        if not count:
+                            continue
+                        confirmed = self.send_to_room(room, count, gift_name=gift_name)
+                        if type(confirmed) is not int or confirmed != count:
+                            raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'confirmed count mismatch; stop delivery')
+                        setattr(self, field, getattr(self, field) + confirmed)
+                    expected[key] = 0
+                    remaining = self._validate_inventory(self.get_inventory())
+                    if getattr(self, field) != stock[key] or remaining != expected:
+                        raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'inventory postcondition mismatch; stop delivery')
+                ok = (self.submitted == stock['ordinary'] and
+                      self.super_fans_submitted == stock['super_fans'] and not any(remaining.values()))
                 self.outcome = 'SENT_INVENTORY_VERIFIED' if ok else 'SEND_FAILED_OR_UNKNOWN'
         except HuyaError as exc:
             self.outcome = exc.code

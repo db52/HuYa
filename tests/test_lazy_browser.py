@@ -23,7 +23,7 @@ class LazyBrowserTests(unittest.TestCase):
             'HUYA_COOKIE': 'fixture=DO_NOT_EXPORT', 'HUYA_ROOMS': '123,456'}, clear=True)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
-        self.api_patch = patch.object(main.HuYaAuto, '_get_hl_count_api', return_value=0)
+        self.api_patch = patch.object(main.HuYaAuto, '_get_inventory_api', return_value={'ordinary': 0, 'super_fans': 0})
         self.api = self.api_patch.start()
         self.addCleanup(self.api_patch.stop)
         self.browser_patch = patch.object(main.HuYaAuto, '_init_browser')
@@ -46,7 +46,7 @@ class LazyBrowserTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()) as out:
                     self.assertTrue(app.run())
                 self.assertEqual(self.artifact(), {
-                    'mode': mode, 'outcome': outcome, 'ordinary_huliang': 0, 'submitted': 0})
+                    'mode': mode, 'outcome': outcome, 'ordinary_huliang': 0, 'submitted': 0, 'super_fans_huliang': 0, 'super_fans_submitted': 0})
                 self.assertNotIn('cleanup failed', out.getvalue())
                 self.assertIsNone(app.driver)
                 send.assert_not_called()
@@ -65,20 +65,20 @@ class LazyBrowserTests(unittest.TestCase):
         self.assertIsNone(self.artifact()['ordinary_huliang'])
 
     def test_nonzero_send_starts_once_and_distribution_unchanged(self):
-        self.api.side_effect = [25, 25, 0]
+        self.api.side_effect = [dict(ordinary=25, super_fans=0), dict(ordinary=0, super_fans=0)]
         driver = self.browser.return_value
         driver.execute_cdp_cmd.return_value = {'success': True}
         app = main.HuYaAuto('send')
         with patch.object(app, 'send_to_room', side_effect=[13, 12]) as send:
             self.assertTrue(app.run())
-            self.assertEqual(send.call_args_list, [call(123, 13), call(456, 12)])
+            self.assertEqual(send.call_args_list, [call(123, 13, gift_name='虎粮'), call(456, 12, gift_name='虎粮')])
         self.browser.assert_called_once()
         driver.execute_cdp_cmd.assert_called_once()
         driver.quit.assert_called_once()
         self.assertEqual(self.artifact()['outcome'], 'SENT_INVENTORY_VERIFIED')
 
     def test_browser_start_failure_records_artifact_without_send(self):
-        self.api.return_value = 25
+        self.api.return_value = dict(ordinary=25, super_fans=0)
         self.browser.side_effect = RuntimeError('DO_NOT_EXPORT')
         app = main.HuYaAuto('send')
         with contextlib.redirect_stdout(io.StringIO()) as out, patch.object(app, 'send_to_room') as send:
@@ -95,7 +95,7 @@ class LazyBrowserTests(unittest.TestCase):
             app.driver = driver
             raise RuntimeError('DO_NOT_EXPORT')
         self.browser.side_effect = partial_start
-        self.api.return_value = 25
+        self.api.return_value = dict(ordinary=25, super_fans=0)
         self.assertFalse(app.run())
         driver.quit.assert_called_once()
         self.assertEqual(self.artifact()['outcome'], 'BROWSER_START_FAILED')
@@ -110,7 +110,7 @@ class LazyBrowserTests(unittest.TestCase):
                 result = self.artifact()
                 self.assertEqual(result['outcome'], 'CONFIG_ERROR')
                 self.assertIsNone(result['ordinary_huliang'])
-                self.assertEqual(set(result), {'mode', 'outcome', 'ordinary_huliang', 'submitted'})
+                self.assertEqual(set(result), {'mode', 'outcome', 'ordinary_huliang', 'submitted', 'super_fans_huliang', 'super_fans_submitted'})
                 self.assertNotIn('DO_NOT_EXPORT', json.dumps(result))
         self.browser.assert_not_called()
         self.api.assert_not_called()

@@ -1,0 +1,26 @@
+name: HuYa 安全回归测试
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: ['fix/huliang-0040-superfans-998']
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+      - run: pip install -r requirements.txt pyyaml
+      - name: 无账号凭据的单元与本地浏览器回归
+        env:
+          HUYA_COOKIE: ''
+          HUYA_ROOMS: ''
+          HUYA_MODE: diagnose
+          RUN_BROWSER_TESTS: '1'
+        run: python -m unittest discover -s tests -v
