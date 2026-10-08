@@ -65,14 +65,14 @@ def github(path):
     opener = urllib.request.build_opener(SafeRedirect())
     with opener.open(req, timeout=20) as response: return response.read()
 
-def previous_state():
+def previous_state(include_current=False):
     data = json.loads(github('/actions/artifacts?name=huya-notification-state&per_page=100'))
     branch = os.environ.get('GITHUB_REF_NAME', 'master')
     run_id = int(os.environ['GITHUB_RUN_ID'])
-    # Never consume a state artifact from another branch or this run.
+    # Same-branch only; all-results checks this run too to suppress rerun duplicates.
     candidates = sorted([a for a in data.get('artifacts', []) if not a.get('expired')
         and a.get('workflow_run', {}).get('head_branch') == branch
-        and a.get('workflow_run', {}).get('id') != run_id], key=lambda a: a['id'], reverse=True)
+        and (include_current or a.get('workflow_run', {}).get('id') != run_id)], key=lambda a: a['id'], reverse=True)
     if not candidates: return None
     raw = github('/actions/artifacts/'+str(candidates[0]['id'])+'/zip')
     if len(raw) > 100000: raise ValueError()
@@ -112,10 +112,25 @@ def summarize(current, run_url):
     if path:
         with open(path,'a') as out: out.write(text)
 
+def result_message(current, url, title='虎牙任务结果'):
+    labels={'EMPTY_STOCK':'库存为空，未赠送', 'SENT_INVENTORY_VERIFIED':'赠送成功，库存已核验',
+            'DIAGNOSE_OK':'只读诊断通过，未赠送'}
+    display=lambda v: '未知' if v is None else str(v)
+    rooms=os.environ.get('HUYA_REPORT_ROOMS','998')
+    if not re.fullmatch(r'[0-9]+(?:,[0-9]+)*', rooms): rooms='未知'
+    message=(title+'\n结果：'+str(labels.get(current['outcome'], current['outcome']))+
+        '\n模式：'+str(current['mode'])+'\n赠送目标：'+rooms+
+        '\n普通虎粮库存：'+display(current['ordinary_huliang'])+'；普通虎粮已确认送出：'+display(current['submitted'])+
+        '\n超粉虎粮库存：'+display(current['super_fans_huliang'])+'；超粉虎粮已确认送出：'+display(current['super_fans_submitted'])+'\n'+url)
+    if current['outcome']=='SEND_FAILED_OR_UNKNOWN': message+='\n可能存在未确认提交，请勿直接重跑送礼。'
+    return message
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--result',default='debug_artifacts/result.json')
     parser.add_argument('--job-status',default='success', choices=['success','failure','cancelled','skipped'])
-    parser.add_argument('--test-notice',action='store_true');args=parser.parse_args()
+    parser.add_argument('--test-notice',action='store_true')
+    parser.add_argument('--all-results',action='store_true',help='报告每次 send 任务，包括空库存及失败')
+    args=parser.parse_args()
     repo=os.environ.get('GITHUB_REPOSITORY','db52/HuYa')
     run=os.environ.get('GITHUB_RUN_ID','0')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repo) or not run.isdigit():return 1
@@ -125,25 +140,22 @@ def main():
         current['outcome']='WORKFLOW_FAILED'
     summarize(current,url)
     if args.test_notice:
-        send_notice('虎牙 Action 通知接入测试：后续仅首次失败、原因变化及恢复提醒；正常运行静默。不发送礼物。\n'+url)
+        send_notice(result_message(current,url,'虎牙通知接入测试（只读，不赠送）'))
         return 0
-    try:previous=previous_state()
+    try:previous=previous_state(include_current=args.all_results)
     except Exception as exc:
         print('NOTICE_STATE_LOOKUP_FAILED category='+type(exc).__name__)
         # No fail-open alert storm or false recovery on history retrieval failure.
         return 1
-    kind=notice_kind(previous,current)
+    if args.all_results and previous and previous.get('run_id') == int(run):
+        print('NOTICE_SILENT same run already attempted; no duplicate retry')
+        return 0
+    kind='result' if args.all_results else notice_kind(previous,current)
     directory=Path('notification_state');directory.mkdir(exist_ok=True)
     state={'healthy':current['outcome'] in GOOD,'outcome':current['outcome'],'run_id':int(run)}
     if kind:
-        titles={'failure':'虎牙任务失败','changed_failure':'虎牙失败原因变化','recovery':'虎牙任务恢复'}
-        message=(titles[kind]+'\n结果：'+current['outcome']+'\n模式：'+current['mode']+
-                 '\n普通虎粮库存：'+str(current['ordinary_huliang'])+
-                 '\n普通虎粮已确认送出：'+str(current['submitted'])+
-                 '\n超粉虎粮库存：'+str(current['super_fans_huliang'])+
-                 '\n超粉虎粮已确认送出：'+str(current['super_fans_submitted'])+'\n'+url)
-        if current['outcome']=='DIAGNOSE_OK':message+='\n登录和库存查询恢复，未验证实际送礼。'
-        if current['outcome']=='SEND_FAILED_OR_UNKNOWN':message+='\n可能存在未确认提交，请勿直接重跑送礼。'
+        titles={'failure':'虎牙任务失败','changed_failure':'虎牙失败原因变化','recovery':'虎牙任务恢复','result':'虎牙任务结果'}
+        message=result_message(current,url,titles[kind])
         try:send_notice(message)
         except Exception as exc:
             # Record this transition as attempted; no automatic uncertain-send retry.
