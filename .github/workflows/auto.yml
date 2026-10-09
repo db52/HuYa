@@ -2,7 +2,7 @@ name: 虎牙虎粮自动发放
 
 on:
   schedule:
-    - cron: '40 16 * * *'  # 北京时间 00:40；仅默认分支调度，GitHub 可能延迟触发
+    - cron: '0 4 * * *'  # 北京时间 12:00；仅默认分支调度，GitHub 可能延迟触发
   workflow_dispatch:
     inputs:
       rooms:

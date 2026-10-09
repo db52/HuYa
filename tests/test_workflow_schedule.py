@@ -5,11 +5,11 @@ import re
 
 
 class ScheduledWorkflowTests(unittest.TestCase):
-    def test_beijing_0040_and_fixed_room_998(self):
+    def test_beijing_1200_and_fixed_room_998(self):
         text = Path('.github/workflows/auto.yml').read_text()
-        self.assertEqual(re.findall(r"- cron: '([^']+)'", text), ['40 16 * * *'])
-        local = datetime(2026, 10, 8, 16, 40, tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
-        self.assertEqual((local.hour, local.minute), (0, 40))
+        self.assertEqual(re.findall(r"- cron: '([^']+)'", text), ['0 4 * * *'])
+        local = datetime(2026, 10, 9, 4, 0, tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+        self.assertEqual((local.hour, local.minute), (12, 0))
         self.assertIn("HUYA_ROOMS: ${{ github.event_name == 'schedule' && '998' || inputs.rooms || '998' }}", text)
         self.assertRegex(text, r"default: '998'")
         self.assertRegex(text, r"default: diagnose")
