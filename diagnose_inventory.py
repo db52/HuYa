@@ -36,6 +36,30 @@ def main():
     try:
         bot=HuYaAuto('diagnose')
         out['package_api']=bot._get_inventory_api()
+        # Compare default URL against cache-busted read-only endpoints.
+        import requests
+        from email.utils import parsedate_to_datetime
+        cache_meta=[]
+        with requests.Session() as session:
+            for part in bot.cookie.split(';'):
+                if '=' in part:
+                    name,value=part.strip().split('=',1)
+                    session.cookies.set(name.strip(),value.strip(),domain='.huya.com',path='/')
+            session.headers.update({'Referer':cfg.URLS['pay_index'],'User-Agent':'Mozilla/5.0 Chrome/152.0.0.0 Safari/537.36'})
+            def safe_metadata(response,*args,**kwargs):
+                date=response.headers.get('Date')
+                try: age_seconds=round(time.time()-parsedate_to_datetime(date).timestamp()) if date else None
+                except Exception: age_seconds=None
+                age=response.headers.get('Age','')
+                cache_meta.append({'response_age_seconds':age_seconds,
+                    'age_header_seconds':int(age) if age.isdigit() else None,
+                    'cache_hit': 'HIT' in response.headers.get('X-Cache','').upper()})
+            session.hooks['response']=[safe_metadata]
+            signed=bot._package_api_get(session,'getTimeSign',{'_':str(time.time_ns())})
+            response=bot._package_api_get(session,'listTotal',{'time':signed['data']['time'],
+                'sign':signed['data']['sign'],'_':str(time.time_ns())})
+            out['package_api_cache_busted']=bot._parse_inventory_response(response)
+        out['read_only_cache_metadata']=cache_meta
         bot._ensure_browser_session()
         def room_ready(driver):
             return driver.execute_script('return Boolean(document.body && document.body.dataset.lp && document.body.dataset.gid)')
