@@ -58,18 +58,20 @@ class InventoryApiTests(unittest.TestCase):
                 self.assertFalse(call.kwargs['allow_redirects'])
             session.post.assert_not_called()
 
-    def test_api_success_skips_browser_fallback(self):
+    def test_api_zero_never_overrides_actual_bag(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
         app._get_inventory_api = MagicMock(return_value={'ordinary': 0, 'super_fans': 0})
-        app._get_inventory_page = MagicMock()
-        self.assertEqual(app.get_hl_count(), 0)
-        app._get_inventory_page.assert_not_called()
+        app._get_inventory_page = MagicMock(return_value={'ordinary': 35, 'super_fans': 10})
+        self.assertTrue(app.login())
+        self.assertEqual(app.get_inventory(), {'ordinary': 35, 'super_fans': 10})
+        app._get_inventory_page.assert_called_once()
+        app._get_inventory_api.assert_called_once()
 
-    def test_api_failure_falls_back_bounded(self):
+    def test_page_failure_not_replaced_by_api_zero(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
-        app._get_inventory_api = MagicMock(side_effect=main.requests.Timeout())
-        app._get_inventory_page = MagicMock(return_value={'ordinary': 25, 'super_fans': 0})
-        with patch.object(main.time, 'sleep'):
-            self.assertEqual(app.get_hl_count(), 25)
-        self.assertEqual(app._get_inventory_api.call_count, 2)
+        app._get_inventory_api = MagicMock(return_value={'ordinary': 0, 'super_fans': 0})
+        app._get_inventory_page = MagicMock(side_effect=main.HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'unavailable'))
+        with self.assertRaises(main.HuyaError):
+            app.get_inventory()
+        app._get_inventory_api.assert_not_called()
         app._get_inventory_page.assert_called_once()

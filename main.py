@@ -30,10 +30,24 @@ DRIVER_ERRORS = (WebDriverException, TransportError, TimeoutError, ConnectionErr
 GIFTS = {'ordinary': '虎粮', 'super_fans': '超粉虎粮'}
 MAX_COUNT = 2**53 - 1
 
-PACK_READY = r"""
-const jq = window.jQuery;
-return Boolean(jq && jq._data && ((jq._data(document, 'events') || {}).click || [])
-    .some(handler => handler.selector === '#nav li'));
+# The official WebPackageV2 app builds the entire list from getPackageGift's
+# decoded vDetail in one React render. An empty initial render is NOT evidence
+# of empty inventory. Require a complete, nonempty, stable application list.
+ACTUAL_BAG_SNAPSHOT = r"""
+const lists = document.querySelectorAll('.g-package-list');
+if (document.readyState !== 'complete' || lists.length !== 1 ||
+    document.querySelector('.g-tips, .g-loading, .m-loading, [aria-busy="true"]'))
+    return {ready: false};
+const items = Array.from(lists[0].querySelectorAll(':scope > .m-gift-item'));
+if (!items.length || items.length !== document.querySelectorAll('.m-gift-item').length)
+    return {ready: false};
+const rows = items.map(item => {
+    const names = item.querySelectorAll(':scope > p');
+    const counts = item.querySelectorAll(':scope > .c-count');
+    return {name: names.length === 1 ? names[0].textContent : null,
+            count: counts.length === 1 ? counts[0].textContent : null};
+});
+return {ready: true, rows};
 """
 
 # The public gift app shows this toast only after iPayRespCode === 0.
@@ -61,53 +75,9 @@ class HuyaError(RuntimeError):
         super().__init__(detail)
 
 
-# Observe only the inventory response already requested by the page. Never
-# export response bodies, credentials, signed URLs or account information.
-INVENTORY_OBSERVER = r"""
-if (!window.jQuery || !window.jQuery.ajaxPrefilter) return false;
-if (window.__huyaInventoryObserver) return true;
-window.__huyaInventoryObserver = true;
-window.__huyaInventory = {loaded: false};
-window.jQuery.ajaxPrefilter(function(options, original, xhr) {
-    let url;
-    try { url = new URL(options.url, location.href); } catch (_) { return; }
-    if (url.searchParams.get('m') !== 'PackageApi' ||
-        url.searchParams.get('do') !== 'listTotal') return;
-    xhr.done(function(response) {
-        const result = {loaded: true, valid: false, counts: null};
-        if (response && Number.isInteger(response.status) && response.status >= 0 && response.status <= 9999)
-            result.business_status = response.status;
-        if (result.business_status === 200 && response.data &&
-            Array.isArray(response.data.package) &&
-            response.data.package.every(x => x && typeof x.cName === 'string' && x.cName.trim())) {
-            const counts = {ordinary: 0, super_fans: 0};
-            result.valid = response.data.package.every(x => {
-                const n = (typeof x.num === 'number' ||
-                    (typeof x.num === 'string' && /^[0-9]+$/.test(x.num))) ? Number(x.num) : NaN;
-                if (!Number.isSafeInteger(n) || n < 0) return false;
-                const key = x.cName === '虎粮' ? 'ordinary' : x.cName === '超粉虎粮' ? 'super_fans' : null;
-                if (key) counts[key] += n;
-                return Object.values(counts).every(Number.isSafeInteger);
-            });
-            if (result.valid) result.counts = counts;
-        }
-        window.__huyaInventory = result;
-    });
-    xhr.fail(function(xhr) {
-        const result = {loaded: true, valid: false, count: null, network_failed: true};
-        if (xhr && Number.isInteger(xhr.status) && xhr.status >= 100 && xhr.status <= 599)
-            result.http_status = xhr.status;
-        window.__huyaInventory = result;
-    });
-});
-return true;
-"""
-
-
 class HuYaAuto:
     def __init__(self, mode='diagnose'):
-        # Establish artifact state before validation. Neither diagnostics nor
-        # verified zero stock requires a browser/driver download.
+        # Establish artifact state before validation; actual bag reads need a browser.
         self.mode = mode if mode in ('diagnose', 'send') else 'diagnose'
         self.outcome = 'NOT_STARTED'
         self.inventory = None
@@ -213,8 +183,8 @@ class HuYaAuto:
                     login_marker_present: Boolean(document.getElementById('huyaNum')),
                     pack_tab_present: Boolean(document.getElementById('packTab')),
                     jquery_present: Boolean(window.jQuery),
-                    inventory_response_seen: Boolean(window.__huyaInventory && window.__huyaInventory.loaded),
-                    inventory_items_rendered: document.querySelectorAll('#myWrap li[data-num]').length
+                    actual_bag_present: document.querySelectorAll('.g-package-list').length === 1,
+                    inventory_items_rendered: document.querySelectorAll('.m-gift-item').length
                 };
             """))
         except Exception as exc:
@@ -274,7 +244,8 @@ class HuYaAuto:
         print('[LOGIN] checking authenticated read-only inventory first')
         for attempt in range(1, 3):
             try:
-                self._authenticated_inventory = self._validate_inventory(self._get_inventory_api())
+                self._validate_inventory(self._get_inventory_api())
+                # This old API is a login guard only, never a stock snapshot.
                 print('[LOGIN] authenticated inventory API confirmed')
                 return True
             except (requests.RequestException, ValueError, HuyaError, *DRIVER_ERRORS) as exc:
@@ -405,84 +376,79 @@ class HuYaAuto:
         return self.get_inventory()['ordinary']
 
     def get_inventory(self):
-        # Login's authenticated snapshot is also the initial stock read, not a
-        # second request that could disagree. Every later read is independent.
-        if hasattr(self, '_authenticated_inventory'):
-            counts = self._authenticated_inventory
-            del self._authenticated_inventory
-            return self._validate_inventory(counts)
-        for attempt in range(1, 3):
-            try:
-                counts = self._validate_inventory(self._get_inventory_api())
-                print(f'[INVENTORY] read-only API confirmed; ordinary_huliang={counts["ordinary"]}; super_fans_huliang={counts["super_fans"]}')
-                return counts
-            except (requests.RequestException, ValueError, HuyaError) as exc:
-                detail = f'{exc.code}: {exc}' if isinstance(exc, HuyaError) else type(exc).__name__
-                print(f'[INVENTORY] read-only API attempt={attempt} error={detail}')
-                if isinstance(exc, HuyaError) and exc.code == 'LOGIN_REQUIRED':
-                    raise
-                if attempt < 2:
-                    time.sleep(2)
-        print('[INVENTORY] API unverified; trying browser inventory as fallback')
-        return self._get_inventory_page()
+        # PackageApi belongs to the old payment page and can falsely report 0.
+        # Never consume its login snapshot, even when it reported positive stock.
+        return self._validate_inventory(self._get_inventory_page())
 
     def _get_hl_count_page(self):
         return self._get_inventory_page()['ordinary']
 
+    @staticmethod
+    def _parse_actual_bag_rows(rows):
+        if not isinstance(rows, list) or not rows:
+            raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag is not proven loaded')
+        counts = dict.fromkeys(GIFTS, 0)
+        seen = set()
+        positive = False
+        for row in rows:
+            if not isinstance(row, dict):
+                raise HuyaError('INVENTORY_RESPONSE_INVALID', 'actual gift row malformed')
+            name, text = row.get('name'), row.get('count')
+            if (not isinstance(name, str) or not name or name != name.strip() or
+                    name in seen or not isinstance(text, str) or len(text) > 16 or
+                    not re.fullmatch(r'[0-9]+', text)):
+                raise HuyaError('INVENTORY_RESPONSE_INVALID', 'actual gift name/count malformed or ambiguous')
+            seen.add(name)
+            count = int(text)
+            if count > MAX_COUNT:
+                raise HuyaError('INVENTORY_RESPONSE_INVALID', 'actual gift count out of range')
+            positive |= count > 0
+            for key, gift in GIFTS.items():
+                if name == gift:
+                    counts[key] = count
+        if not positive:
+            raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag lacks positive loaded evidence')
+        return counts
+
     def _get_inventory_page(self):
         self._ensure_browser_session()
-        print('[INVENTORY] querying 虎粮 and 超粉虎粮 in one snapshot')
-        failure = HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'inventory page did not become ready')
-        for attempt in range(1, 3):
-            try:
-                def ready(driver):
-                    tab = EC.element_to_be_clickable((By.ID, cfg.PAY_PAGE['pack_tab']))(driver)
-                    # The page binds navigation handlers in mainv2.js. A static
-                    # packTab existing in HTML alone does not prove JS is ready.
-                    handlers = driver.execute_script(PACK_READY)
-                    return tab if handlers else False
-                if not self._safe_get(cfg.URLS['pay_index'], 'inventory_page', ready=ready,
-                                      timeout=45, attempts=1):
-                    raise TimeoutException()
-                if not self.driver.execute_script(INVENTORY_OBSERVER):
-                    raise TimeoutException()
-                self.driver.find_element(By.ID, cfg.PAY_PAGE['pack_tab']).click()
+        # Diagnose has no configured room requirement; 998 supplies read-only
+        # app parameters. Opening the bag never hovers/clicks a gift.
+        room = self.rooms[0] if getattr(self, 'rooms', None) else 998
+        try:
+            room_ready = lambda driver: driver.execute_script(
+                'return Boolean(document.body.dataset.lp && document.body.dataset.gid)')
+            if not self._safe_get(cfg.URLS['room_base'].format(room), 'inventory_room', ready=room_ready):
+                raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag room parameters unavailable')
+            lp, gid = self.driver.execute_script('return [document.body.dataset.lp, document.body.dataset.gid]')
+            if (not isinstance(lp, str) or not re.fullmatch(r'[0-9]+', lp) or
+                    not isinstance(gid, str) or not re.fullmatch(r'[0-9]+', gid)):
+                raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag room parameters invalid')
+            sample = {'rows': None, 'since': 0.0}
 
-                def inventory_loaded(driver):
-                    result = driver.execute_script('return window.__huyaInventory || {loaded:false}')
-                    return result if result.get('loaded') else False
+            def loaded(driver):
+                result = driver.execute_script(ACTUAL_BAG_SNAPSHOT)
+                if not isinstance(result, dict) or result.get('ready') is not True:
+                    sample.update(rows=None, since=0.0)
+                    return False
+                rows = result.get('rows')
+                counts = self._parse_actual_bag_rows(rows)
+                now = time.monotonic()
+                if rows != sample['rows']:
+                    sample.update(rows=rows, since=now)
+                    return False
+                # Two separate polls plus a quiet interval, not an early partial
+                # render. React commits the returned vDetail list atomically.
+                return counts if now - sample['since'] >= 1.0 else False
 
-                result = WebDriverWait(self.driver, 30, poll_frequency=0.5).until(inventory_loaded)
-                status = result.get('business_status')
-                if type(status) is int and 0 <= status <= 9999:
-                    if status == 501:
-                        raise HuyaError('LOGIN_REQUIRED', 'listTotal: browser business_status=501; login required')
-                    if status != 200:
-                        raise HuyaError('INVENTORY_API_REJECTED', f'listTotal: browser business_status={status}')
-                if result.get('network_failed'):
-                    http = result.get('http_status')
-                    if type(http) is int and 100 <= http <= 599:
-                        raise HuyaError('INVENTORY_HTTP_FAILED', f'listTotal: browser HTTP {http}')
-                    raise HuyaError('INVENTORY_NETWORK_FAILED', 'listTotal: browser request failed')
-                if (type(status) is not int or status != 200 or result.get('valid') is not True):
-                    raise HuyaError('INVENTORY_RESPONSE_INVALID', 'listTotal: browser inventory response invalid')
-                counts = self._validate_inventory(result.get('counts'))
-                print(f'[INVENTORY] query confirmed; ordinary_huliang={counts["ordinary"]}; super_fans_huliang={counts["super_fans"]}')
-                return counts
-            except (*DRIVER_ERRORS, HuyaError) as exc:
-                if isinstance(exc, HuyaError):
-                    failure = exc
-                    detail = f'{exc.code}: {exc}'
-                else:
-                    failure = HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'inventory page/response did not become ready')
-                    detail = type(exc).__name__
-                print(f'[INVENTORY] failed attempt={attempt} error={detail}')
-                if failure.code == 'LOGIN_REQUIRED':
-                    raise failure
-                self._debug_capture('inventory_query')
-                if attempt < 2:
-                    time.sleep(2)
-        raise failure
+            if not self._safe_get(cfg.URLS['gift_tab'].format(lp=lp, gid=gid),
+                                  'actual_inventory', ready=loaded, timeout=30, attempts=1):
+                raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag did not become fully loaded')
+            counts = self._parse_actual_bag_rows(sample['rows'])
+            print(f'[INVENTORY] actual gift bag confirmed; ordinary_huliang={counts["ordinary"]}; super_fans_huliang={counts["super_fans"]}')
+            return counts
+        except DRIVER_ERRORS:
+            raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag browser unavailable') from None
 
     def _gift_result(self):
         result = self.driver.execute_script('return window.__huyaGiftResult || {status:"pending"}')
@@ -513,7 +479,7 @@ class HuYaAuto:
     def send_to_room(self, room_id, count, *, gift_name):
         if self.mode != 'send':
             raise HuyaError('SEND_DISABLED', 'diagnose mode cannot call gift delivery')
-        if gift_name not in GIFTS.values() or type(count) is not int or not 0 <= count <= MAX_COUNT:
+        if gift_name != '虎粮' or type(count) is not int or not 0 <= count <= MAX_COUNT:
             raise HuyaError('CONFIG_ERROR', 'unsupported gift or invalid count')
         if count <= 0:
             return 0
@@ -590,34 +556,30 @@ class HuYaAuto:
                 self.outcome = 'DIAGNOSE_OK'
                 print('[DIAGNOSE] login and inventory verified; gift delivery disabled')
                 ok = True
-            elif not any(stock.values()):
+            elif stock['ordinary'] == 0:
                 self.outcome = 'EMPTY_STOCK'
-                print('[INVENTORY] verified empty; nothing to send')
+                print('[INVENTORY] ordinary stock verified zero; super-fans gift delivery disabled')
                 ok = True
             else:
                 self._ensure_browser_session()
-                expected = dict(stock)
-                remaining = dict(stock)
-                for key, gift_name in GIFTS.items():
-                    if stock[key] == 0:
+                per, remainder = divmod(stock['ordinary'], len(self.rooms))
+                for index, room in enumerate(self.rooms):
+                    count = per + int(index < remainder)
+                    if not count:
                         continue
-                    per, remainder = divmod(stock[key], len(self.rooms))
-                    field = 'submitted' if key == 'ordinary' else 'super_fans_submitted'
-                    for index, room in enumerate(self.rooms):
-                        count = per + int(index < remainder)
-                        if not count:
-                            continue
-                        confirmed = self.send_to_room(room, count, gift_name=gift_name)
-                        if type(confirmed) is not int or confirmed != count:
-                            raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'confirmed count mismatch; stop delivery')
-                        setattr(self, field, getattr(self, field) + confirmed)
-                    expected[key] = 0
+                    confirmed = self.send_to_room(room, count, gift_name='虎粮')
+                    if type(confirmed) is not int or confirmed != count:
+                        raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'confirmed count mismatch; stop delivery')
+                    self.submitted += confirmed
+                try:
                     remaining = self._validate_inventory(self.get_inventory())
-                    if getattr(self, field) != stock[key] or remaining != expected:
-                        raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'inventory postcondition mismatch; stop delivery')
-                ok = (self.submitted == stock['ordinary'] and
-                      self.super_fans_submitted == stock['super_fans'] and not any(remaining.values()))
-                self.outcome = 'SENT_INVENTORY_VERIFIED' if ok else 'SEND_FAILED_OR_UNKNOWN'
+                except Exception:
+                    raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'fresh actual gift bag postcondition unavailable; do not retry') from None
+                if (self.submitted != stock['ordinary'] or remaining['ordinary'] != 0 or
+                        remaining['super_fans'] != stock['super_fans']):
+                    raise HuyaError('SEND_FAILED_OR_UNKNOWN', 'inventory postcondition mismatch; stop delivery')
+                self.outcome = 'SENT_INVENTORY_VERIFIED'
+                ok = True
         except HuyaError as exc:
             self.outcome = exc.code
             print(f'[ERROR] {exc.code}: {exc}')
