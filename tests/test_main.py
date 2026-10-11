@@ -109,7 +109,7 @@ class CoreTests(unittest.TestCase):
         with patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError) as exc:
             main.HuYaAuto._get_hl_count_page(app)
         self.assertEqual(exc.exception.code, 'INVENTORY_PAGE_UNAVAILABLE')
-        self.assertEqual(app._safe_get.call_count, 2)
+        self.assertEqual(app._safe_get.call_count, 1)
 
     def test_transport_timeout_retries_readonly_navigation(self):
         app = self.make_app()
@@ -180,16 +180,7 @@ class BrowserFixtureTests(unittest.TestCase):
         cls.response = {'status': 200, 'data': {'package': [{'cName': '虎粮', 'num': 25}]}}
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                html = '''<!doctype html><body><button id="packTab">包裹</button><div id="myWrap"></div>
-                <script>
-                const hooks = [];
-                window.jQuery = {ajaxPrefilter: f => hooks.push(f), _data: () => ({click: [{selector:'#nav li'}]})};
-                document.getElementById('packTab').onclick = () => {
-                    hooks.forEach(f => f({url:'https://q.huya.com/index.php?m=PackageApi&do=listTotal'}, {}, {
-                        done: cb => setTimeout(() => cb(RESPONSE), 200), fail: () => {}
-                    }));
-                };
-                </script>'''.replace('RESPONSE', json.dumps(cls.response))
+                html = '<!doctype html><body></body>'
                 data = html.encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -213,42 +204,6 @@ class BrowserFixtureTests(unittest.TestCase):
         cls.app.driver.quit()
         cls.server.shutdown()
         cls.server.server_close()
-
-    def test_real_browser_inventory_observer_and_exact_gift(self):
-        cases = [
-            ([{'cName': '虎粮', 'num': 25}], 25),
-            ([{'cName': '超粉虎粮', 'num': 99}, {'cName': '虎粮', 'num': 5}], 5),
-            ([{'cName': '虎粮', 'num': 0}], 0),
-            ([], 0),
-        ]
-        for package, expected in cases:
-            with self.subTest(package=package), patch.dict(main.cfg.URLS, pay_index=self.url):
-                type(self).response = {'status': 200, 'data': {'package': package}}
-                self.assertEqual(self.app._get_hl_count_page(), expected)
-
-    def test_real_browser_invalid_response_is_error(self):
-        type(self).response = {'status': 401, 'data': {}}
-        with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
-            with self.assertRaises(main.HuyaError):
-                self.app._get_hl_count_page()
-
-    def test_real_browser_bad_numeric_stock_is_error(self):
-        for value in (-1, None, '', True, 'not-a-count'):
-            type(self).response = {'status': 200, 'data': {'package': [{'cName': '虎粮', 'num': value}]}}
-            with self.subTest(value=value), patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
-                with self.assertRaises(main.HuyaError):
-                    self.app._get_hl_count_page()
-
-    def test_real_browser_malformed_package_is_not_empty(self):
-        type(self).response = {'status': 200, 'data': {'package': [{'unexpected': 25}]}}
-        with patch.dict(main.cfg.URLS, pay_index=self.url), patch.object(main.time, 'sleep'):
-            with self.assertRaises(main.HuyaError):
-                self.app._get_hl_count_page()
-
-    def test_real_browser_unrelated_handler_not_ready(self):
-        self.app._safe_get(self.url, 'fixture', ready=lambda d: d.execute_script('return Boolean(window.jQuery)'))
-        self.app.driver.execute_script("window.jQuery._data = () => ({click:[{selector:'.unrelated'}]})")
-        self.assertFalse(self.app.driver.execute_script(main.PACK_READY))
 
     def test_real_browser_toast_success_failure_and_stale(self):
         self.app._safe_get(self.url, 'fixture')

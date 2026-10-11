@@ -13,29 +13,34 @@ import main
 
 
 @unittest.skipUnless(os.getenv('RUN_BROWSER_TESTS') == '1', 'opt-in localhost browser fixtures')
-class SuperFansBrowserTests(unittest.TestCase):
+class ActualBagBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 path = urlsplit(self.path).path
                 if path == '/room/998':
-                    html = '<!doctype html><body data-lp="fixture-lp-998" data-gid="fixture-gid"></body>'
-                elif path == '/inventory':
-                    package = [{'cName': name, 'num': count} for name, count in cls.counts.items()]
-                    if cls.bad_package is not None:
-                        package = cls.bad_package
-                    payload = json.dumps({'status': 200, 'data': {'package': package}})
-                    html = '''<!doctype html><body><button id="packTab">包裹</button><script>
-                    const hooks=[];window.jQuery={ajaxPrefilter:f=>hooks.push(f),_data:()=>({click:[{selector:'#nav li'}]})};
-                    window.inventoryEvents=0;
-                    document.getElementById('packTab').onclick=()=>{window.inventoryEvents++;
-                        hooks.forEach(f=>f({url:'/index.php?m=PackageApi&do=listTotal'}, {}, {
-                            done:cb=>setTimeout(()=>cb(PAYLOAD),20),fail:()=>{}
-                        }));};</script>'''.replace('PAYLOAD', payload)
+                    html = '<!doctype html><body data-lp="998" data-gid="1"></body>'
                 elif path == '/gift':
-                    items = ''.join('<div class="m-gift-item" style="display:inline-block;margin:20px;padding:15px"><i class="c-count">99</i><p>'+name+'</p></div>' for name in cls.names)
-                    html = '''<!doctype html><body>ITEMS<script>
+                    rows = cls.rows if cls.rows is not None else [(name, str(cls.counts.get(name, 99))) for name in cls.names if cls.counts.get(name, 99) > 0]
+                    items = ''.join('<div class="m-gift-item" style="display:inline-block;margin:20px;padding:15px"><i class="c-count">'+count+'</i><p>'+name+'</p></div>' for name, count in rows)
+                    if cls.behavior == 'empty':
+                        items = ''
+                    if cls.behavior == 'loading':
+                        items = '<div aria-busy="true">loading</div>' + items
+                    if cls.behavior == 'partial':
+                        items += '<div class="m-gift-item"><p>未加载</p></div>'
+                    if cls.behavior == 'failure':
+                        items += '<div class="g-tips"><p>请求失败</p></div>'
+                    if cls.behavior == 'changing':
+                        # An early valid super-only sample must not be accepted
+                        # before the later complete ordinary+super render.
+                        items += '''<script>
+                        const ordinary = Array.from(document.querySelectorAll('.m-gift-item')).find(x=>x.querySelector('p').textContent==='虎粮');
+                        ordinary.remove();
+                        setTimeout(()=>document.querySelector('.g-package-list').appendChild(ordinary), 600);
+                        </script>'''
+                    html = '''<!doctype html><body><div class="g-package-list">ITEMS</div><script>
                     const popupName=POPUPNAME;
                     window.sendClicks=0;window.confirmClicks=0;
                     document.querySelectorAll('.m-gift-item').forEach(item=>item.onmouseenter=()=>{
@@ -95,7 +100,8 @@ class SuperFansBrowserTests(unittest.TestCase):
         cls = type(self)
         cls.names = ['超粉虎粮', '虎粮', '虎粮礼包', '超级超粉虎粮']
         cls.counts = {'虎粮': 35, '超粉虎粮': 10}
-        cls.submits, cls.popup_name, cls.receipt, cls.bad_package = [], None, True, None
+        cls.submits, cls.popup_name, cls.receipt, cls.rows = [], None, True, None
+        cls.behavior = None
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.app = main.HuYaAuto.__new__(main.HuYaAuto)
@@ -107,64 +113,107 @@ class SuperFansBrowserTests(unittest.TestCase):
         self.addCleanup(self.app.driver.quit)
         self.app.wait = main.WebDriverWait(self.app.driver, 1.5)
         self.app._browser_authenticated = True
+        real_wait = main.WebDriverWait
+        waits = patch.object(main, 'WebDriverWait', side_effect=lambda driver, timeout, **kw: real_wait(driver, min(timeout, 2.5), **kw))
+        waits.start()
+        self.addCleanup(waits.stop)
         urls = patch.dict(main.cfg.URLS, room_base=self.base+'/room/{}',
-                          gift_tab=self.base+'/gift?lp={lp}&gid={gid}', pay_index=self.base+'/inventory')
+                          gift_tab=self.base+'/gift?lp={lp}&gid={gid}')
         urls.start()
         self.addCleanup(urls.stop)
 
-    def test_selected_super_name_real_hover_input_submit_and_stock(self):
-        before = self.app._get_inventory_page()
-        self.assertEqual(before, {'ordinary': 35, 'super_fans': 10})
-        self.assertEqual(self.app.driver.execute_script('return window.inventoryEvents'), 1)
-        self.assertEqual(self.app.send_to_room(998, 10, gift_name='超粉虎粮'), 10)
-        self.assertEqual(type(self).submits, [{'name': '超粉虎粮', 'count': 10}])
+    def test_ordinary_real_hover_submit_and_fresh_actual_bag(self):
+        self.assertEqual(self.app.get_inventory(), {'ordinary': 35, 'super_fans': 10})
+        self.assertEqual(self.app.send_to_room(998, 35, gift_name='虎粮'), 35)
+        self.assertEqual(type(self).submits, [{'name': '虎粮', 'count': 35}])
         self.assertEqual(self.app.driver.execute_script('return [window.sendClicks,window.confirmClicks,window.__huyaGiftResult.status]'), [1, 1, 'success'])
-        self.assertEqual(self.app._get_inventory_page(), {'ordinary': 35, 'super_fans': 0})
-        self.assertEqual(self.app.driver.execute_script('return window.inventoryEvents'), 1)
+        self.assertEqual(self.app.get_inventory(), {'ordinary': 0, 'super_fans': 10})
 
-    def test_both_types_run_real_local_business_receipts_and_readbacks(self):
-        # Only login is bypassed: no account or production cookie exists. All
-        # inventory observation, selection, hover, clicks and receipts are real
-        # DOM and localhost HTTP operations, NOT evidence of a Huya live send.
-        with patch.object(self.app, 'login', return_value=True), patch.object(self.app, 'get_inventory', side_effect=self.app._get_inventory_page):
+    def test_ordinary_only_run_local_receipt_and_actual_bag_postcondition(self):
+        # Real localhost DOM/HTTP/browser operations, never a live Huya send.
+        with patch.object(self.app, 'login', return_value=True):
             self.assertTrue(self.app.run())
-        self.assertEqual(type(self).submits, [{'name': '虎粮', 'count': 35}, {'name': '超粉虎粮', 'count': 10}])
+        self.assertEqual(type(self).submits, [{'name': '虎粮', 'count': 35}])
         data = json.loads((self.app.debug_dir / 'result.json').read_text())
         self.assertEqual(data['outcome'], 'SENT_INVENTORY_VERIFIED')
-        self.assertEqual((data['submitted'], data['super_fans_submitted']), (35, 10))
-        self.assertEqual(type(self).counts, {'虎粮': 0, '超粉虎粮': 0})
+        self.assertEqual((data['submitted'], data['super_fans_submitted']), (35, 0))
+        self.assertEqual(type(self).counts, {'虎粮': 0, '超粉虎粮': 10})
+
+    def test_super_even_explicit_call_forbidden_before_navigation(self):
+        before = self.app.driver.current_url
+        for count in (10, 0):
+            with self.assertRaises(main.HuyaError):
+                self.app.send_to_room(998, count, gift_name='超粉虎粮')
+        self.assertEqual(self.app.driver.current_url, before)
+        self.assertEqual(type(self).submits, [])
+
+    def test_ordinary_absent_super10_proves_zero_and_no_send(self):
+        type(self).counts['虎粮'] = 0
+        self.assertEqual(self.app.get_inventory(), {'ordinary': 0, 'super_fans': 10})
+        with patch.object(self.app, 'login', return_value=True):
+            self.assertTrue(self.app.run())
+        self.assertEqual(type(self).submits, [])
+        data = json.loads((self.app.debug_dir / 'result.json').read_text())
+        self.assertEqual(data['outcome'], 'EMPTY_STOCK')
+
+    def test_diagnose_readonly_both_positive_never_gifts(self):
+        self.app.mode = 'diagnose'
+        with patch.object(self.app, 'login', return_value=True):
+            self.assertTrue(self.app.run())
+        self.assertEqual(type(self).submits, [])
+        self.assertEqual(self.app.submitted, 0)
 
     def test_ambiguous_or_partial_names_never_click(self):
-        for names in [['虎粮礼包', '超级超粉虎粮'], ['超粉虎粮', '超粉虎粮'], ['超粉虎粮 虎粮', '虎粮']]:
+        for names in [['虎粮礼包', '超级超粉虎粮'], ['虎粮', '虎粮']]:
             type(self).names = names
             with self.subTest(names=names), self.assertRaises(main.HuyaError):
-                self.app.send_to_room(998, 10, gift_name='超粉虎粮')
+                self.app.send_to_room(998, 35, gift_name='虎粮')
             self.assertEqual(type(self).submits, [])
             self.assertEqual(self.app.driver.execute_script('return window.sendClicks'), 0)
 
     def test_wrong_active_popup_prevents_submit(self):
-        type(self).popup_name = '虎粮'
+        type(self).popup_name = '超粉虎粮'
         with self.assertRaises(main.HuyaError):
-            self.app.send_to_room(998, 10, gift_name='超粉虎粮')
+            self.app.send_to_room(998, 35, gift_name='虎粮')
         self.assertEqual(type(self).submits, [])
         self.assertEqual(self.app.driver.execute_script('return window.sendClicks'), 0)
 
-    def test_unknown_super_receipt_never_retries(self):
+    def test_unknown_receipt_never_retries(self):
         type(self).receipt = False
-        real_wait = main.WebDriverWait
-        with patch.object(main, 'WebDriverWait', side_effect=lambda driver, timeout, **kw: real_wait(driver, min(timeout, 1.5), **kw)):
-            with self.assertRaises(main.HuyaError) as caught:
-                self.app.send_to_room(998, 10, gift_name='超粉虎粮')
+        with self.assertRaises(main.HuyaError) as caught:
+            self.app.send_to_room(998, 35, gift_name='虎粮')
         self.assertEqual(caught.exception.code, 'SEND_FAILED_OR_UNKNOWN')
-        self.assertEqual(type(self).submits, [{'name': '超粉虎粮', 'count': 10}])
+        self.assertEqual(type(self).submits, [{'name': '虎粮', 'count': 35}])
         self.assertEqual(self.app.driver.execute_script('return [window.sendClicks,window.confirmClicks]'), [1, 1])
 
-    def test_malformed_super_or_unrelated_count_invalidates_entire_event(self):
-        for name in ['超粉虎粮', '其他礼物']:
-            type(self).bad_package = [{'cName': '虎粮', 'num': 0}, {'cName': name, 'num': True}]
-            with self.subTest(name=name), patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError):
-                self.app._get_inventory_page()
-            self.assertEqual(type(self).submits, [])
+    def test_not_loaded_partial_and_empty_fail_closed(self):
+        for behavior in ('empty', 'loading', 'partial', 'failure'):
+            type(self).behavior = behavior
+            with self.subTest(behavior=behavior), patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError) as caught:
+                self.app.get_inventory()
+            self.assertIn(caught.exception.code, ('INVENTORY_PAGE_UNAVAILABLE', 'INVENTORY_RESPONSE_INVALID'))
+        self.assertEqual(type(self).submits, [])
+
+    def test_malformed_ambiguous_and_truncated_counts_fail_closed(self):
+        for rows in [[('虎粮', '999+'), ('超粉虎粮', '10')], [('虎粮', '35'), ('虎粮', '35')], [('虎粮', '35'), ('其他礼物', '-1')], [('虎粮礼包', '35'), ('超粉虎粮', '10')]]:
+            type(self).rows = rows
+            if rows[0][0] == '虎粮礼包':
+                self.assertEqual(self.app.get_inventory(), {'ordinary': 0, 'super_fans': 10})
+            else:
+                with self.subTest(rows=rows), self.assertRaises(main.HuyaError):
+                    self.app.get_inventory()
+        self.assertEqual(type(self).submits, [])
+
+    def test_changing_rows_wait_for_complete_stable_snapshot(self):
+        type(self).behavior = 'changing'
+        self.assertEqual(self.app.get_inventory(), {'ordinary': 35, 'super_fans': 10})
+        self.assertEqual(type(self).submits, [])
+
+    def test_network_failure_or_wrong_page_never_becomes_zero(self):
+        with patch.dict(main.cfg.URLS, gift_tab=self.base+'/missing?lp={lp}&gid={gid}'), self.assertRaises(main.HuyaError) as caught:
+            self.app.get_inventory()
+        self.assertEqual(caught.exception.code, 'INVENTORY_PAGE_UNAVAILABLE')
+        self.assertEqual(type(self).submits, [])
 
 
 if __name__ == '__main__':

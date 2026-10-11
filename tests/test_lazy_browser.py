@@ -39,18 +39,16 @@ class LazyBrowserTests(unittest.TestCase):
         self.browser.assert_not_called()
         self.api.assert_not_called()
 
-    def test_diagnose_and_zero_send_work_without_browser(self):
+    def test_api_zero_requires_actual_bag_even_diagnose_or_zero_send(self):
         for mode, outcome in [('diagnose', 'DIAGNOSE_OK'), ('send', 'EMPTY_STOCK')]:
             with self.subTest(mode=mode), patch.object(main.HuYaAuto, 'send_to_room') as send:
                 app = main.HuYaAuto(mode)
-                with contextlib.redirect_stdout(io.StringIO()) as out:
+                with patch.object(app, '_get_inventory_page', return_value=dict(ordinary=0, super_fans=10)) as bag:
                     self.assertTrue(app.run())
-                self.assertEqual(self.artifact(), {
-                    'mode': mode, 'outcome': outcome, 'ordinary_huliang': 0, 'submitted': 0, 'super_fans_huliang': 0, 'super_fans_submitted': 0})
-                self.assertNotIn('cleanup failed', out.getvalue())
-                self.assertIsNone(app.driver)
+                bag.assert_called_once()
+                self.assertEqual(self.artifact()['outcome'], outcome)
+                self.assertEqual(self.artifact()['super_fans_submitted'], 0)
                 send.assert_not_called()
-        self.browser.assert_not_called()
 
     def test_login_rejection_has_artifact_no_browser_retry_send(self):
         self.api.side_effect = main.HuyaError('LOGIN_REQUIRED', 'getTimeSign: HTTP 200; business_status=501; login required')
@@ -65,11 +63,11 @@ class LazyBrowserTests(unittest.TestCase):
         self.assertIsNone(self.artifact()['ordinary_huliang'])
 
     def test_nonzero_send_starts_once_and_distribution_unchanged(self):
-        self.api.side_effect = [dict(ordinary=25, super_fans=0), dict(ordinary=0, super_fans=0)]
+        self.api.return_value = dict(ordinary=0, super_fans=0)
         driver = self.browser.return_value
         driver.execute_cdp_cmd.return_value = {'success': True}
         app = main.HuYaAuto('send')
-        with patch.object(app, 'send_to_room', side_effect=[13, 12]) as send:
+        with patch.object(app, '_get_inventory_page', side_effect=[dict(ordinary=25, super_fans=0), dict(ordinary=0, super_fans=0)]), patch.object(app, 'send_to_room', side_effect=[13, 12]) as send:
             self.assertTrue(app.run())
             self.assertEqual(send.call_args_list, [call(123, 13, gift_name='虎粮'), call(456, 12, gift_name='虎粮')])
         self.browser.assert_called_once()
@@ -85,7 +83,7 @@ class LazyBrowserTests(unittest.TestCase):
             self.assertFalse(app.run())
             send.assert_not_called()
         self.assertEqual(self.artifact()['outcome'], 'BROWSER_START_FAILED')
-        self.assertEqual(self.artifact()['ordinary_huliang'], 25)
+        self.assertIsNone(self.artifact()['ordinary_huliang'])
         self.assertNotIn('DO_NOT_EXPORT', out.getvalue())
 
     def test_partial_browser_start_cleanup(self):
@@ -127,43 +125,13 @@ class LazyBrowserTests(unittest.TestCase):
         sleep.assert_called_once_with(2)
         self.assertTrue(app._browser_authenticated)
 
-    def test_page_login_rejection_not_retried_or_confused_with_empty(self):
-        app = main.HuYaAuto()
-        app.driver = MagicMock()
-        app._browser_authenticated = True
-        app._safe_get = MagicMock(return_value=True)
-        app._debug_capture = MagicMock()
-        with patch.object(main, 'WebDriverWait') as wait, patch.object(main.time, 'sleep') as sleep:
-            wait.return_value.until.return_value = {
-                'loaded': True, 'valid': False, 'business_status': 501, 'count': None}
-            with self.assertRaises(main.HuyaError) as caught:
-                app._get_hl_count_page()
-            self.assertEqual(caught.exception.code, 'LOGIN_REQUIRED')
-            app._safe_get.assert_called_once()
-            sleep.assert_not_called()
-
-    def test_page_network_schema_and_business_failures_stay_distinct(self):
-        cases = [
-            ({'business_status': 502}, 'INVENTORY_API_REJECTED'),
-            ({'network_failed': True, 'http_status': 503}, 'INVENTORY_HTTP_FAILED'),
-            ({'network_failed': True, 'http_status': 'DO_NOT_EXPORT'}, 'INVENTORY_NETWORK_FAILED'),
-            ({'business_status': '501'}, 'INVENTORY_RESPONSE_INVALID'),
-            ({'business_status': 200, 'valid': True, 'count': True}, 'INVENTORY_RESPONSE_INVALID'),
-        ]
-        for result, code in cases:
-            with self.subTest(code=code):
-                app = main.HuYaAuto()
-                app.driver = MagicMock()
-                app._browser_authenticated = True
-                app._safe_get = MagicMock(return_value=True)
-                app._debug_capture = MagicMock()
-                with patch.object(main, 'WebDriverWait') as wait, patch.object(main.time, 'sleep'):
-                    wait.return_value.until.return_value = dict(loaded=True, **result)
-                    with self.assertRaises(main.HuyaError) as caught:
-                        app._get_hl_count_page()
-                    self.assertEqual(caught.exception.code, code)
-                    self.assertNotIn('DO_NOT_EXPORT', str(caught.exception))
-                    self.assertEqual(app._safe_get.call_count, 2)
+    def test_bag_failure_is_not_legacy_api_empty(self):
+        app = main.HuYaAuto('send')
+        with patch.object(app, '_get_inventory_page', side_effect=main.HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'unavailable')), patch.object(app, 'send_to_room') as send:
+            self.assertFalse(app.run())
+        self.assertEqual(self.artifact()['outcome'], 'INVENTORY_PAGE_UNAVAILABLE')
+        self.assertIsNone(self.artifact()['ordinary_huliang'])
+        send.assert_not_called()
 
 
 if __name__ == '__main__':

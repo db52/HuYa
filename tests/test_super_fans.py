@@ -30,27 +30,27 @@ class TwoGiftTests(unittest.TestCase):
         app._record_result = MagicMock()
         return app
 
-    def test_super_only_triggers_send(self):
-        app = self.app([stock(super_fans=10), stock()])
+    def test_super_only_never_sends(self):
+        app = self.app([stock(super_fans=10)])
         self.assertTrue(app.run())
-        app.send_to_room.assert_called_once_with(998, 10, gift_name='超粉虎粮')
-        self.assertEqual((app.submitted, app.super_fans_submitted), (0, 10))
-        self.assertEqual(app.get_inventory.call_count, 2)
+        app.send_to_room.assert_not_called()
+        self.assertEqual((app.submitted, app.super_fans_submitted), (0, 0))
+        self.assertEqual(app.get_inventory.call_count, 1)
+        self.assertEqual(app.outcome, 'EMPTY_STOCK')
 
-    def test_both_types_sequential_distribution_and_independent_readbacks(self):
-        app = self.app([stock(35, 10), stock(0, 10), stock()], rooms=(998, 123, 456))
+    def test_ordinary_only_distribution_and_fresh_readback(self):
+        app = self.app([stock(35, 10), stock(0, 10)], rooms=(998, 123, 456))
         self.assertTrue(app.run())
         self.assertEqual(app.send_to_room.call_args_list, [
-            call(998, 12, gift_name='虎粮'), call(123, 12, gift_name='虎粮'), call(456, 11, gift_name='虎粮'),
-            call(998, 4, gift_name='超粉虎粮'), call(123, 3, gift_name='超粉虎粮'), call(456, 3, gift_name='超粉虎粮')])
-        self.assertEqual(app.get_inventory.call_count, 3)
-        self.assertEqual((app.submitted, app.super_fans_submitted), (35, 10))
+            call(998, 12, gift_name='虎粮'), call(123, 12, gift_name='虎粮'), call(456, 11, gift_name='虎粮')])
+        self.assertEqual(app.get_inventory.call_count, 2)
+        self.assertEqual((app.submitted, app.super_fans_submitted), (35, 0))
         self.assertEqual(app.outcome, 'SENT_INVENTORY_VERIFIED')
 
     def test_small_stock_skips_zero_rooms(self):
-        app = self.app([stock(1, 1), stock(0, 1), stock()], rooms=(998, 123))
+        app = self.app([stock(1, 1), stock(0, 1)], rooms=(998, 123))
         self.assertTrue(app.run())
-        self.assertEqual(app.send_to_room.call_args_list, [call(998, 1, gift_name='虎粮'), call(998, 1, gift_name='超粉虎粮')])
+        self.assertEqual(app.send_to_room.call_args_list, [call(998, 1, gift_name='虎粮')])
 
     def test_both_zero_no_browser_or_send(self):
         app = self.app([stock()])
@@ -82,18 +82,17 @@ class TwoGiftTests(unittest.TestCase):
                 app.send_to_room.assert_called_once_with(998, 35, gift_name='虎粮')
                 self.assertEqual(app.outcome, 'SEND_FAILED_OR_UNKNOWN')
 
-    def test_super_unknown_stops_no_retry(self):
-        app = self.app([stock(35, 10), stock(0, 10)], rooms=(998, 123))
-        app.send_to_room.side_effect = [18, 17, main.HuyaError('SEND_FAILED_OR_UNKNOWN', 'uncertain')]
+    def test_failed_postread_is_unknown_and_never_retried(self):
+        app = self.app([stock(35, 10), main.HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'unavailable')])
         self.assertFalse(app.run())
-        self.assertEqual(app.send_to_room.call_args_list, [call(998, 18, gift_name='虎粮'), call(123, 17, gift_name='虎粮'), call(998, 5, gift_name='超粉虎粮')])
-        self.assertEqual(app.super_fans_submitted, 0)
+        app.send_to_room.assert_called_once_with(998, 35, gift_name='虎粮')
+        self.assertEqual(app.outcome, 'SEND_FAILED_OR_UNKNOWN')
         self.assertEqual(app.get_inventory.call_count, 2)
 
-    def test_super_remaining_not_zero_is_unknown(self):
-        app = self.app([stock(super_fans=10), stock(super_fans=1)])
+    def test_super_change_without_super_send_is_unknown(self):
+        app = self.app([stock(35, 10), stock(0, 0)])
         self.assertFalse(app.run())
-        app.send_to_room.assert_called_once()
+        app.send_to_room.assert_called_once_with(998, 35, gift_name='虎粮')
         self.assertEqual(app.outcome, 'SEND_FAILED_OR_UNKNOWN')
 
     def test_incorrect_receipt_count_stops(self):
@@ -128,26 +127,25 @@ class TwoGiftTests(unittest.TestCase):
             app.send_to_room.assert_not_called()
             app._ensure_browser_session.assert_not_called()
 
-    def test_login_snapshot_consumed_once_then_fresh_read(self):
+    def test_login_guard_discarded_then_fresh_bag_reads(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
-        app._get_inventory_api = MagicMock(side_effect=[stock(35, 10), stock(0, 10)])
-        app._ensure_browser = MagicMock()
+        app._get_inventory_api = MagicMock(return_value=stock())
+        app._get_inventory_page = MagicMock(side_effect=[stock(35, 10), stock(0, 10)])
         self.assertTrue(app.login())
         self.assertEqual(app.get_inventory(), stock(35, 10))
-        self.assertEqual(app._get_inventory_api.call_count, 1)
         self.assertEqual(app.get_inventory(), stock(0, 10))
-        self.assertEqual(app._get_inventory_api.call_count, 2)
-        app._ensure_browser.assert_not_called()
+        app._get_inventory_api.assert_called_once()
+        self.assertEqual(app._get_inventory_page.call_count, 2)
 
     def test_legacy_ordinary_projection_no_duplicate_requests(self):
         app = main.HuYaAuto.__new__(main.HuYaAuto)
-        app._get_inventory_api = MagicMock(return_value=stock(35, 10))
+        app._get_inventory_page = MagicMock(return_value=stock(35, 10))
         self.assertEqual(app.get_hl_count(), 35)
-        app._get_inventory_api.assert_called_once()
+        app._get_inventory_page.assert_called_once()
 
     def test_only_allowlisted_gifts_and_integer_counts_before_browser(self):
         app = self.app([stock()])
-        for name, count in [('火箭', 1), ('虎粮礼包', 1), ('超粉虎粮', True), ('虎粮', -1)]:
+        for name, count in [('火箭', 1), ('虎粮礼包', 1), ('超粉虎粮', 10), ('超粉虎粮', 0), ('超粉虎粮', True), ('虎粮', -1)]:
             with self.assertRaises(main.HuyaError):
                 main.HuYaAuto.send_to_room(app, 998, count, gift_name=name)
         app._ensure_browser_session.assert_not_called()
@@ -159,7 +157,7 @@ class TwoGiftTests(unittest.TestCase):
             self.assertTrue(app.run())
             main.HuYaAuto._record_result(app)
             data = report.safe_result(Path(d) / 'result.json')
-            self.assertEqual(data, dict(mode='send', outcome='SENT_INVENTORY_VERIFIED', ordinary_huliang=35, submitted=35, super_fans_huliang=10, super_fans_submitted=10))
+            self.assertEqual(data, dict(mode='send', outcome='SENT_INVENTORY_VERIFIED', ordinary_huliang=35, submitted=35, super_fans_huliang=10, super_fans_submitted=0))
             path = Path(d) / 'old.json'
             path.write_text(json.dumps(dict(mode='send', outcome='EMPTY_STOCK', ordinary_huliang=0, submitted=0)))
             old = report.safe_result(path)
@@ -169,7 +167,7 @@ class TwoGiftTests(unittest.TestCase):
             with patch.dict(os.environ, GITHUB_STEP_SUMMARY=str(summary)):
                 report.summarize(data, 'https://example.test/run')
             text = summary.read_text()
-            for line in ['普通虎粮库存：35', '普通虎粮已确认送出：35', '超粉虎粮库存：10', '超粉虎粮已确认送出：10']:
+            for line in ['普通虎粮库存：35', '普通虎粮已确认送出：35', '超粉虎粮库存：10', '超粉虎粮已确认送出：0']:
                 self.assertIn(line, text)
             path.write_text(json.dumps(dict(mode='send', outcome='EMPTY_STOCK', ordinary_huliang=0, submitted=0, super_fans_huliang=True, super_fans_submitted='SECRET', cookie='SECRET')))
             self.assertNotIn('SECRET', json.dumps(report.safe_result(path)))

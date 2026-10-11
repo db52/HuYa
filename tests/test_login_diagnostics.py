@@ -151,12 +151,12 @@ class LoginDiagnosticTests(unittest.TestCase):
 
     def test_expired_login_during_inventory_does_not_fallback(self):
         app = self.make_app()
-        app._get_inventory_api = MagicMock(side_effect=main.HuyaError('LOGIN_REQUIRED', 'listTotal: login required'))
-        app._get_inventory_page = MagicMock()
+        app._get_inventory_api = MagicMock()
+        app._get_inventory_page = MagicMock(side_effect=main.HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual bag not loaded'))
         with self.assertRaises(main.HuyaError):
             app.get_hl_count()
-        app._get_inventory_api.assert_called_once()
-        app._get_inventory_page.assert_not_called()
+        app._get_inventory_api.assert_not_called()
+        app._get_inventory_page.assert_called_once()
 
     def test_send_run_with_rejected_login_never_queries_or_sends(self):
         app = self.make_app()

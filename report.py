@@ -105,7 +105,7 @@ def summarize(current, run_url):
         '- 普通虎粮库存：'+str(current['ordinary_huliang']),
         '- 普通虎粮已确认送出：'+str(current['submitted']),
         '- 超粉虎粮库存：'+str(current.get('super_fans_huliang')),
-        '- 超粉虎粮已确认送出：'+str(current.get('super_fans_submitted')),
+        '- 超粉虎粮已确认送出：'+str(current.get('super_fans_submitted'))+'（已停用赠送，仅保留库存观察）',
         '- diagnose 不送礼；结果未知时不要盲目重跑。',
         '[运行记录]('+run_url+')', ''])
     path=os.environ.get('GITHUB_STEP_SUMMARY')
@@ -113,7 +113,7 @@ def summarize(current, run_url):
         with open(path,'a') as out: out.write(text)
 
 def result_message(current, url, title='虎牙任务结果'):
-    labels={'EMPTY_STOCK':'库存为空，未赠送', 'SENT_INVENTORY_VERIFIED':'赠送成功，库存已核验',
+    labels={'EMPTY_STOCK':'普通虎粮为空，本次跳过', 'SENT_INVENTORY_VERIFIED':'赠送成功，库存已核验',
             'DIAGNOSE_OK':'只读诊断通过，未赠送'}
     display=lambda v: '未知' if v is None else str(v)
     rooms=os.environ.get('HUYA_REPORT_ROOMS','998')
@@ -121,7 +121,7 @@ def result_message(current, url, title='虎牙任务结果'):
     message=(title+'\n结果：'+str(labels.get(current['outcome'], current['outcome']))+
         '\n模式：'+str(current['mode'])+'\n赠送目标：'+rooms+
         '\n普通虎粮库存：'+display(current['ordinary_huliang'])+'；普通虎粮已确认送出：'+display(current['submitted'])+
-        '\n超粉虎粮库存：'+display(current['super_fans_huliang'])+'；超粉虎粮已确认送出：'+display(current['super_fans_submitted'])+'\n'+url)
+        '\n超粉虎粮库存：'+display(current['super_fans_huliang'])+'；超粉虎粮已确认送出：'+display(current['super_fans_submitted'])+'（已停用，不赠送）\n库存来源：实际送礼包裹\n'+url)
     if current['outcome']=='SEND_FAILED_OR_UNKNOWN': message+='\n可能存在未确认提交，请勿直接重跑送礼。'
     return message
 
