@@ -1,90 +1,45 @@
-name: 虎牙虎粮自动发放
-
+name: 只读双来源包裹诊断
 on:
-  schedule:
-    - cron: '0 4 * * *'  # 北京时间 12:00；仅默认分支调度，GitHub 可能延迟触发
   workflow_dispatch:
     inputs:
-      rooms:
-        description: '手动操作的房间号；定时任务固定送到 998'
-        required: false
-        default: '998'
       mode:
-        description: 'diagnose 仅验证登录和库存，不发送礼物'
         type: choice
-        options:
-          - diagnose
-          - send
-        required: true
+        options: [diagnose]
         default: diagnose
+      rooms:
+        default: '998'
       test_notice:
-        description: '仅 diagnose 模式可用：发送一条通知接入测试'
         type: boolean
-        required: false
         default: false
-
 permissions:
   contents: read
-  actions: read
-
 concurrency:
   group: huya-inventory-and-gifts
   cancel-in-progress: false
-
 jobs:
-  send-hl:
+  diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: pip
-      - name: 安装 Python 依赖
-        run: pip install -r requirements.txt
-      - name: 无凭证安全回归测试
-        run: python -m unittest discover -s tests -v
-      - name: 验证登录与库存 / 显式赠送
+      - run: pip install -r requirements.txt
+      - name: 无凭据诊断安全测试
+        run: python -m unittest discover -s tests -p test_dual_diagnose.py -v
+      - name: 只读查询两个库存来源（不点击礼物或赠送）
         env:
           HUYA_COOKIE: ${{ secrets.HUYA_COOKIE }}
-          HUYA_ROOMS: ${{ github.event_name == 'schedule' && '998' || inputs.rooms || '998' }}
-          HUYA_MODE: ${{ github.event_name == 'schedule' && 'send' || inputs.mode || 'diagnose' }}
+          HUYA_ROOMS: '998'
+          HUYA_MODE: diagnose
           HEADLESS: 'true'
           PYTHONUNBUFFERED: '1'
-        run: python -u main.py --mode "$HUYA_MODE"
-      - name: 保存脱敏诊断结果（不含 Cookie、原始 HTML、截图）
+        run: python -u diagnose_inventory.py
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: huya-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: debug_artifacts/*.json
-          if-no-files-found: ignore
+          name: huya-dual-${{ github.run_id }}
+          path: dual_diagnostics/result.json
           retention-days: 3
-      - name: 结果摘要与去重 Telegram 提醒
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-          JOB_STATUS: ${{ job.status }}
-          ALL_RESULTS: ${{ github.event_name == 'schedule' || inputs.mode == 'send' }}
-          HUYA_REPORT_ROOMS: ${{ github.event_name == 'schedule' && '998' || inputs.rooms || '998' }}
-          TEST_NOTICE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'diagnose' && inputs.test_notice || false }}
-        run: |
-          if [ "$TEST_NOTICE" = "true" ]; then
-            python report.py --job-status "$JOB_STATUS" --test-notice
-          elif [ "$ALL_RESULTS" = "true" ]; then
-            python report.py --job-status "$JOB_STATUS" --all-results
-          else
-            python report.py --job-status "$JOB_STATUS"
-          fi
-      - name: 保存通知状态（仅用于失败／恢复去重）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: huya-notification-state
-          path: notification_state/state.json
-          if-no-files-found: ignore
-          retention-days: 90
