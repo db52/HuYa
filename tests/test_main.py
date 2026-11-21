@@ -143,7 +143,7 @@ class CoreTests(unittest.TestCase):
             if script.startswith('window.__huyaNavigationMarker ='):
                 marker['value'] = args[0]
             elif '__huyaNavigationMarker' in script:
-                return marker.get('value')
+                return [app.driver.current_url, marker.get('value') == args[0], True]
             return True
         app.driver.execute_script.side_effect = execute
         class OnePoll:

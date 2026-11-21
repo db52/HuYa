@@ -2,13 +2,13 @@
 
 ## 诊断与安全边界
 
-- 手动 Action 和 `python main.py` 默认是 **diagnose**：仅确认登录和普通虎粮库存，禁止送礼。
+- 手动 Action 和 `python main.py` 默认使用 **diagnose**，查询登录状态、普通虎粮和超粉虎粮库存。只有普通虎粮参与赠送。
 - 显式 `python main.py --mode send` / Action `mode=send` 才赠送；定时任务仍使用 send，仅在默认分支运行。
 - 已在 GitHub Actions 验证诊断及真实赠送：登录有效、普通虎粮 25 个送出、业务成功提示及库存归零均确认。定时执行仍可能受网络、页面变化和 Cookie 有效期影响；发生结果未知时请人工核对，不要盲目重跑。
-- 页面使用 `page_load_strategy=none` + 关键元素就绪检查。登录/库存最多重试两次，发送和确认按钮不自动重试。
-- 优先直接调用网页同款只读 `getTimeSign` → `listTotal` GET 接口，避免充值页无关资源阻塞；明确业务状态 501（未登录）立即停止，网络或结构失败才尝试网页。只精确匹配普通“虎粮”，不包含超粉虎粮。查询失败不当作零库存。
-- 浏览器延迟启动：诊断或 API 确认零库存无需 Chrome，实际送礼或必要网页回退才启动。
-- Actions 结果摘要直接显示模式、结果、库存和已确认数量。Telegram 仅首次失败、原因变化及恢复提醒，正常运行静默。去重状态来自同分支的历史 artifact（保留90天）；读取失败不会盲目群发，通知结果未知不自动重发。
+- 页面使用 `page_load_strategy=none` 并等待关键元素就绪。每次赠送最多点击一次发送按钮和一次确认按钮。
+- 登录优先调用只读 `getTimeSign` 和 `listTotal` 接口。业务状态 501 表示需要重新登录，其他查询异常会尝试网页登录检查。
+- 登录通过后，Chrome 打开实际送礼包裹核对库存。如果背包页一直只有空列表，等待 30 秒后重新加载一次。两次都无法确认库存时，任务报告查询失败。赠送后的库存核对也使用这个只读流程。
+- Actions 摘要显示模式、结果、库存和已确认数量。每次 send 都向 Telegram 报告结果。diagnose 在首次失败、原因变化及恢复时提醒，正常运行静默。去重状态来自同分支的历史 artifact（保留 90 天）。
 - 通知需 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`TELEGRAM_THREAD_ID` 三个 Secret。手动 diagnose 可用 `test_notice=true` 发送接入测试；不进行送礼。
 - GitHub 定时调度可能延迟，01:00 是期望触发时间，不保证准点。
 - 公共 artifact 仅包含白名单 JSON（阶段、就绪状态、结果），不保存/上传 Cookie、原始 HTML、截图、完整 URL 或用户名。
@@ -27,7 +27,7 @@ RUN_BROWSER_TESTS=1 python -m unittest discover -s tests -v
 ---
 
 ## ✨ 特性
-- 🔐 **安全配置**：Cookie / 房间号通过 GitHub Secrets 管理，不泄露
+- 🔐 **凭证管理**：登录 Cookie 通过 GitHub Secrets 提供
 - 🤖 **全自动运行**：支持定时执行 + 手动触发
 - 📦 **无冗余依赖**：仅需 Selenium 环境，超轻量
 - 🎯 **精准分配**：自动读取背包虎粮，批量分配到多个房间
@@ -55,9 +55,7 @@ config.py                   # 页面选择器（唯一配置文件）
 ### 2. GitHub 部署
 1. Fork 本仓库
 2. 进入仓库 **Settings → Secrets and variables → Actions**
-3. 添加 **2 个必需密钥**（缺少任意一个将直接停止运行）：
-   - `HUYA_COOKIE`：你的虎牙登录 Cookie
-   - `HUYA_ROOMS`：房间号列表，英文逗号分隔（例：`518512,1964,294636272`）
+3. 在 Secrets 中添加 `HUYA_COOKIE`（虎牙登录 Cookie）。定时任务固定使用房间 `998`。手动运行可通过 `rooms` 输入多个房间号，用英文逗号分隔。
 
 4. 进入 **Actions** → 启用工作流
 5. 完成！每天 **北京时间 01:00** 自动运行
@@ -69,7 +67,7 @@ config.py                   # 页面选择器（唯一配置文件）
 1. 进入仓库 Actions
 2. 选择 `虎牙虎粮自动发放`
 3. 点击 `Run workflow`
-4. 可自定义输入房间号（覆盖密钥配置）
+4. 默认运行只读诊断。选择 `send` 可向 `rooms` 中指定的房间赠送，默认房间为 `998`。
 
 ### 方式 2：本地运行
 ```bash
@@ -90,7 +88,7 @@ python main.py
 | 名称 | 说明 |
 |------|------|
 | HUYA_COOKIE | 登录凭证（必须） |
-| HUYA_ROOMS | 目标房间号列表（必须） |
+| HUYA_ROOMS | 本地 send 模式必填，多个目标房间用英文逗号分隔；本地 diagnose 可省略 |
 
 ---
 
@@ -107,7 +105,7 @@ on:
 ---
 
 ## 📌 运行流程
-1. 验证 Cookie / 房间号（缺少直接退出）
+1. 检查 Cookie，送礼模式另需有效房间号
 2. 打开背包页面，读取虎粮数量
 3. 自动分配数量到所有房间
 4. 依次进入房间 → 悬停虎粮 → 自定义数量 → 赠送
