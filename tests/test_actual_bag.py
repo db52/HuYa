@@ -1,6 +1,6 @@
 """Actual bag parsing guards: offline, no production cookies or requests."""
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import main
 
@@ -51,6 +51,27 @@ class ActualBagTests(unittest.TestCase):
         self.assertEqual(app.get_inventory(), {'ordinary': 35, 'super_fans': 10})
         app._get_inventory_page.assert_called_once()
         app._get_inventory_api.assert_not_called()
+
+    def test_same_rows_in_a_new_document_restart_the_stability_interval(self):
+        app = main.HuYaAuto.__new__(main.HuYaAuto)
+        app._ensure_browser_session = MagicMock()
+        app.driver = MagicMock()
+        rows = [{'name': '虎粮', 'count': '25'}]
+        app.driver.execute_script.side_effect = [
+            ['998', '1'],
+            *[{'ready': True, 'rows': rows, 'documentStart': start} for start in (10, 20, 20)],
+        ]
+
+        def navigate(url, label, ready, **kwargs):
+            if label == 'inventory_room':
+                return True
+            self.assertFalse(ready(app.driver))
+            self.assertFalse(ready(app.driver))
+            return ready(app.driver)
+
+        with patch.object(app, '_safe_get', side_effect=navigate), \
+                patch.object(main.time, 'monotonic', side_effect=[1.0, 5.0, 6.0]):
+            self.assertEqual(app.get_inventory(), {'ordinary': 25, 'super_fans': 0})
 
 
 if __name__ == '__main__':

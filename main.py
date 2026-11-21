@@ -47,7 +47,7 @@ const rows = items.map(item => {
     return {name: names.length === 1 ? names[0].textContent : null,
             count: counts.length === 1 ? counts[0].textContent : null};
 });
-return {ready: true, rows};
+return {ready: true, rows, documentStart: performance.timeOrigin};
 """
 
 # The public gift app shows this toast only after iPayRespCode === 0.
@@ -194,7 +194,7 @@ class HuYaAuto:
         print('[DIAGNOSTIC] ' + json.dumps(data, ensure_ascii=False))
 
     def _safe_get(self, url, label, ready=None, timeout=40, attempts=2):
-        """Retry navigation only; never wraps clicks that submit gifts."""
+        """Return the readiness predicate's result, or False after navigation retries."""
         expected = urlsplit(url)
         hosts = {expected.hostname}
         if expected.hostname == 'huya.com':
@@ -203,15 +203,18 @@ class HuYaAuto:
         marker = None
 
         def page_ready(driver):
-            current = urlsplit(driver.current_url)
+            # Check the URL and document identity in one WebDriver round trip.
+            url_now, old_document, has_body = driver.execute_script("""
+                return [location.href, window.__huyaNavigationMarker === arguments[0],
+                        Boolean(document.body)];
+            """, marker)
+            if old_document or not has_body:
+                return False
+            current = urlsplit(url_now)
             if current.hostname not in hosts or current.path != expected.path or current.scheme != expected.scheme:
                 return False
             actual_query = parse_qs(current.query)
             if any(actual_query.get(key) != value for key, value in parse_qs(expected.query).items()):
-                return False
-            if driver.execute_script('return window.__huyaNavigationMarker || null') == marker:
-                return False
-            if not driver.execute_script('return Boolean(document.body)'):
                 return False
             return ready(driver) if ready else True
 
@@ -226,9 +229,9 @@ class HuYaAuto:
                 except TimeoutException:
                     # A load timeout is recoverable only if the target becomes usable.
                     print(f'[NAV] {label}: load event timeout, checking readiness')
-                WebDriverWait(self.driver, timeout, poll_frequency=0.5).until(page_ready)
+                result = WebDriverWait(self.driver, timeout, poll_frequency=0.5).until(page_ready)
                 print(f'[NAV] {label}: ready attempt={attempt}')
-                return True
+                return result
             except DRIVER_ERRORS as exc:
                 print(f'[NAV] {label}: not ready attempt={attempt} error={type(exc).__name__}')
                 self._debug_capture(label)
@@ -424,27 +427,28 @@ class HuYaAuto:
             if (not isinstance(lp, str) or not re.fullmatch(r'[0-9]+', lp) or
                     not isinstance(gid, str) or not re.fullmatch(r'[0-9]+', gid)):
                 raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag room parameters invalid')
-            sample = {'rows': None, 'since': 0.0}
+            previous = None
+            stable_since = 0.0
 
             def loaded(driver):
-                result = driver.execute_script(ACTUAL_BAG_SNAPSHOT)
-                if not isinstance(result, dict) or result.get('ready') is not True:
-                    sample.update(rows=None, since=0.0)
+                nonlocal previous, stable_since
+                snapshot = driver.execute_script(ACTUAL_BAG_SNAPSHOT)
+                if not isinstance(snapshot, dict) or snapshot.get('ready') is not True:
+                    previous = None
                     return False
-                rows = result.get('rows')
-                counts = self._parse_actual_bag_rows(rows)
+                counts = self._parse_actual_bag_rows(snapshot.get('rows'))
                 now = time.monotonic()
-                if rows != sample['rows']:
-                    sample.update(rows=rows, since=now)
+                # A reload starts a new stability interval even for identical rows.
+                if snapshot != previous:
+                    previous, stable_since = snapshot, now
                     return False
-                # Two separate polls plus a quiet interval, not an early partial
-                # render. React commits the returned vDetail list atomically.
-                return counts if now - sample['since'] >= 1.0 else False
+                return counts if now - stable_since >= 1.0 else False
 
-            if not self._safe_get(cfg.URLS['gift_tab'].format(lp=lp, gid=gid),
-                                  'actual_inventory', ready=loaded, timeout=30, attempts=1):
+            # Only reload this read-only bag view. Submission stays outside the retry.
+            counts = self._safe_get(cfg.URLS['gift_tab'].format(lp=lp, gid=gid),
+                                    'actual_inventory', ready=loaded, timeout=30, attempts=2)
+            if not counts:
                 raise HuyaError('INVENTORY_PAGE_UNAVAILABLE', 'actual gift bag did not become fully loaded')
-            counts = self._parse_actual_bag_rows(sample['rows'])
             print(f'[INVENTORY] actual gift bag confirmed; ordinary_huliang={counts["ordinary"]}; super_fans_huliang={counts["super_fans"]}')
             return counts
         except DRIVER_ERRORS:

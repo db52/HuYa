@@ -22,9 +22,10 @@ class ActualBagBrowserTests(unittest.TestCase):
                 if path == '/room/998':
                     html = '<!doctype html><body data-lp="998" data-gid="1"></body>'
                 elif path == '/gift':
+                    cls.bag_loads += 1
                     rows = cls.rows if cls.rows is not None else [(name, str(cls.counts.get(name, 99))) for name in cls.names if cls.counts.get(name, 99) > 0]
                     items = ''.join('<div class="m-gift-item" style="display:inline-block;margin:20px;padding:15px"><i class="c-count">'+count+'</i><p>'+name+'</p></div>' for name, count in rows)
-                    if cls.behavior == 'empty':
+                    if cls.behavior == 'empty' or cls.bag_loads in cls.empty_loads:
                         items = ''
                     if cls.behavior == 'loading':
                         items = '<div aria-busy="true">loading</div>' + items
@@ -101,6 +102,7 @@ class ActualBagBrowserTests(unittest.TestCase):
         cls.names = ['超粉虎粮', '虎粮', '虎粮礼包', '超级超粉虎粮']
         cls.counts = {'虎粮': 35, '超粉虎粮': 10}
         cls.submits, cls.popup_name, cls.receipt, cls.rows = [], None, True, None
+        cls.bag_loads, cls.empty_loads = 0, set()
         cls.behavior = None
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -147,6 +149,26 @@ class ActualBagBrowserTests(unittest.TestCase):
         self.assertEqual(self.app.driver.current_url, before)
         self.assertEqual(type(self).submits, [])
 
+    def test_empty_first_load_recovers_before_and_after_single_submit(self):
+        # Bag reads 1 and 4 are empty. Load 3 is the separate gift submission page.
+        cls = type(self)
+        cls.empty_loads = {1, 4}
+        with patch.object(self.app, 'login', return_value=True):
+            self.assertTrue(self.app.run())
+        self.assertEqual(cls.bag_loads, 5)
+        self.assertEqual(cls.submits, [{'name': '虎粮', 'count': 35}])
+        self.assertEqual(self.app.outcome, 'SENT_INVENTORY_VERIFIED')
+
+    def test_persistently_empty_list_stops_after_one_reload(self):
+        cls = type(self)
+        cls.behavior = 'empty'
+        with patch.object(self.app, 'login', return_value=True):
+            self.assertFalse(self.app.run())
+        self.assertEqual(cls.bag_loads, 2)
+        self.assertEqual(cls.submits, [])
+        self.assertIsNone(self.app.inventory)
+        self.assertEqual(self.app.outcome, 'INVENTORY_PAGE_UNAVAILABLE')
+
     def test_ordinary_absent_super10_proves_zero_and_no_send(self):
         type(self).counts['虎粮'] = 0
         self.assertEqual(self.app.get_inventory(), {'ordinary': 0, 'super_fans': 10})
@@ -186,8 +208,8 @@ class ActualBagBrowserTests(unittest.TestCase):
         self.assertEqual(type(self).submits, [{'name': '虎粮', 'count': 35}])
         self.assertEqual(self.app.driver.execute_script('return [window.sendClicks,window.confirmClicks]'), [1, 1])
 
-    def test_not_loaded_partial_and_empty_fail_closed(self):
-        for behavior in ('empty', 'loading', 'partial', 'failure'):
+    def test_not_loaded_and_partial_fail_closed(self):
+        for behavior in ('loading', 'partial', 'failure'):
             type(self).behavior = behavior
             with self.subTest(behavior=behavior), patch.object(main.time, 'sleep'), self.assertRaises(main.HuyaError) as caught:
                 self.app.get_inventory()
