@@ -32,6 +32,15 @@ class ActualBagBrowserTests(unittest.TestCase):
                         items += '<div class="m-gift-item"><p>未加载</p></div>'
                     if cls.behavior == 'failure':
                         items += '<div class="g-tips"><p>请求失败</p></div>'
+                    if cls.behavior == 'zero_placeholder':
+                        items += '''<script>
+                        const badges = Array.from(document.querySelectorAll('.c-count'));
+                        const counts = badges.map(badge => badge.textContent);
+                        badges.forEach(badge => { badge.textContent = '0'; });
+                        setTimeout(() => badges.forEach((badge, i) => {
+                            badge.textContent = counts[i];
+                        }), 600);
+                        </script>'''
                     if cls.behavior == 'changing':
                         # An early valid super-only sample must not be accepted
                         # before the later complete ordinary+super render.
@@ -207,6 +216,18 @@ class ActualBagBrowserTests(unittest.TestCase):
     def test_changing_rows_wait_for_complete_stable_snapshot(self):
         type(self).behavior = 'changing'
         self.assertEqual(self.app.get_inventory(), {'ordinary': 35, 'super_fans': 10})
+        self.assertEqual(type(self).submits, [])
+
+    def test_zero_placeholder_waits_for_real_counts(self):
+        type(self).behavior = 'zero_placeholder'
+        self.assertEqual(self.app.get_inventory(), {'ordinary': 35, 'super_fans': 10})
+        self.assertEqual(type(self).submits, [])
+
+    def test_persistent_zero_placeholder_stays_unverified(self):
+        type(self).rows = [('虎粮', '0'), ('超粉虎粮', '0')]
+        with self.assertRaises(main.HuyaError) as caught:
+            self.app.get_inventory()
+        self.assertEqual(caught.exception.code, 'INVENTORY_PAGE_UNAVAILABLE')
         self.assertEqual(type(self).submits, [])
 
     def test_network_failure_or_wrong_page_never_becomes_zero(self):

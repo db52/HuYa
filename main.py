@@ -432,7 +432,14 @@ class HuYaAuto:
                     sample.update(rows=None, since=0.0)
                     return False
                 rows = result.get('rows')
-                counts = self._parse_actual_bag_rows(rows)
+                try:
+                    counts = self._parse_actual_bag_rows(rows)
+                except HuyaError as exc:
+                    if exc.code != 'INVENTORY_PAGE_UNAVAILABLE':
+                        raise
+                    # A rendered list of zeroes can precede the first real stock update.
+                    sample.update(rows=None, since=0.0)
+                    return False
                 now = time.monotonic()
                 if rows != sample['rows']:
                     sample.update(rows=rows, since=now)
